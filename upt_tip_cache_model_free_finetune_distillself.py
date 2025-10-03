@@ -859,6 +859,33 @@ class UPT(nn.Module):
             self.filtered_hoi_idx = []
             self.zs_type = None
 
+        # Diffusion bridge for modality alignment (optional, inference-only)
+        self.use_diffusion_bridge = args.use_diffusion_bridge if hasattr(args, 'use_diffusion_bridge') else False
+        if self.use_diffusion_bridge:
+            from diffusion_bridge_module import DiffusionBridgeHOI
+            diffusion_config = kwargs.get('diffusion_config', None)
+            if diffusion_config is not None:
+                print(f"\n{'='*60}")
+                print("Initializing Diffusion Bridge for HOI Detection")
+                print(f"{'='*60}")
+                self.diffusion_bridge = DiffusionBridgeHOI(
+                    diffusion_path=diffusion_config['model_path'],
+                    text_mean_path=diffusion_config['text_mean_path'],
+                    inference_steps=diffusion_config.get('inference_steps', 600),
+                    scale_factor=diffusion_config.get('scale_factor', 5.0),
+                    verbose=True
+                )
+                print(f"✓ Diffusion bridge initialized and ready")
+                print(f"  Mode: Inference-only (frozen weights)")
+                print(f"  Integration point: After image adapter, before classification")
+                print(f"{'='*60}\n")
+            else:
+                print("Warning: use_diffusion_bridge=True but no diffusion_config provided")
+                print("Diffusion bridge will not be used.")
+                self.diffusion_bridge = None
+        else:
+            self.diffusion_bridge = None
+
         # self.unseen_verb_idxs = []
         self.label_choice = args.label_choice
         self.img_align = args.img_align
@@ -1242,6 +1269,11 @@ class UPT(nn.Module):
                 adapter_feat = (self.mem_adapter(vis_feat.unsqueeze(1))).squeeze(1)
             else:
                 adapter_feat = vis_feat
+
+            # Apply diffusion bridge (ONLY at inference, to bridge vision→text gap)
+            if self.diffusion_bridge is not None and not self.training:
+                adapter_feat = self.diffusion_bridge(adapter_feat)
+
             if self.txt_align is True:
                 adapt_hoitxt_features = self.txtmem_adapter(hoitxt_features.unsqueeze(0)).squeeze(0)
             else:
@@ -2160,6 +2192,16 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
 
     model = CustomCLIP(args, classnames=selected_classnames, clip_model=clip_model, object_class_to_target_class=class_corr)
 
+    # Prepare diffusion bridge config if enabled
+    diffusion_config = None
+    if args.use_diffusion_bridge:
+        diffusion_config = {
+            'model_path': args.diffusion_model_path,
+            'text_mean_path': args.diffusion_text_mean,
+            'inference_steps': args.diffusion_inference_steps,
+            'scale_factor': 5.0  # Standard diffusion-bridge scale
+        }
+
     detector = UPT(args,
         detr, postprocessors['bbox'], model, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,
@@ -2179,6 +2221,7 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         select_HOI_index = select_HOI_index,
         fixed_clip_enctxt = fixed_clip_model.encode_text,
         unseen_text_priors = unseen_text_priors,
-        act_descriptor_feat_select = act_descriptor_feat_select
+        act_descriptor_feat_select = act_descriptor_feat_select,
+        diffusion_config = diffusion_config  # Pass diffusion config
     )
     return detector

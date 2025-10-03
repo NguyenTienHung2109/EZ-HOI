@@ -720,7 +720,17 @@ if __name__ == '__main__':
     parser.add_argument('--origin_ctx', default=False, action='store_true')
     parser.add_argument('--finetune_allcls_utpl', default=False, action='store_true')
 
-    
+    # Diffusion bridge arguments (for modality alignment at inference)
+    parser.add_argument('--use_diffusion_bridge', default=False, action='store_true',
+                        help='Apply diffusion bridge at inference to reduce modality gap')
+    parser.add_argument('--diffusion_model_path', type=str, default='hoi_diffusion_results/model-300.pt',
+                        help='Path to trained diffusion model')
+    parser.add_argument('--diffusion_text_mean', type=str, default='hicodet_pkl_files/hoi_text_mean_vitB_600.pkl',
+                        help='Path to HOI text mean for normalization')
+    parser.add_argument('--diffusion_inference_steps', type=int, default=600,
+                        help='Number of DDIM sampling steps (100-1000, trade-off speed/quality)')
+
+
 
 
     args = parser.parse_args()
