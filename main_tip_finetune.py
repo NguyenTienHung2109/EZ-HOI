@@ -291,12 +291,12 @@ def main(rank, args):
 
     if os.path.exists(args.resume_part):
         print(f"===>>> Rank {rank}: partially continue from saved checkpoint {args.resume}")
-        checkpoint_part = torch.load(args.resume_part, map_location='cpu')
+        checkpoint_part = torch.load(args.resume_part, map_location='cpu', weights_only=False)
         upt.load_state_dict(checkpoint_part['model_state_dict'])  ## , strict = False
 
     if os.path.exists(args.resume):
         print(f"===>>> Rank {rank}: continue from saved checkpoint {args.resume}")
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if args.dataset == 'swig' and args.eval:
             ckpt = checkpoint['model_state_dict']
             test_hoi_ids = torch.as_tensor([interaction["id"] for interaction in SWIG_INTERACTIONS if interaction["evaluation"] == 1])

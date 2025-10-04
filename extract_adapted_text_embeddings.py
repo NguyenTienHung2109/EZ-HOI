@@ -45,7 +45,7 @@ def load_checkpoint_and_args(checkpoint_path):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     if 'args' not in checkpoint:
         print("Warning: 'args' not found in checkpoint. You need to provide all arguments manually.")
@@ -73,18 +73,35 @@ def recreate_model(args, device='cuda'):
     print("Recreating model structure...")
     print("="*60)
 
-    # Import necessary functions
-    from main_tip_finetune import hico_class_corr, vcoco_class_corr
+    # Import necessary functions (HICODET only)
+    from main_tip_finetune import hico_class_corr
     from hico_list import hico_verb_object_list, hico_verbs
-    from vcoco_list import vcoco_verb_object_list, vcoco_verbs
+    import numpy as np
 
-    # Setup dataset-specific configurations
-    if args.dataset == 'hicodet':
-        object_to_target = hico_class_corr()
-        object_n_verb_to_interaction = hico_verb_object_list()
-    else:
-        object_to_target = vcoco_class_corr()
-        object_n_verb_to_interaction = vcoco_verb_object_list()
+    # Setup HICODET configurations
+    object_to_target = hico_class_corr()
+
+    # Create 2D lookup table [num_objects, num_actions] -> hoi_idx
+    # For HICODET: 80 objects, 117 actions
+    # object_to_target format: [[hoi_idx, obj_idx, verb_idx], ...]
+    lut = np.full([80, 117], None)
+    for hoi_idx, obj_idx, verb_idx in object_to_target:
+        lut[obj_idx, verb_idx] = hoi_idx
+    object_n_verb_to_interaction = lut.tolist()
+
+    # Initialize distributed training (required by build_detector)
+    # build_detector calls dist.get_rank() which requires initialization
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        print(f"Initializing distributed training (single process)...")
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(
+            backend=backend,
+            init_method="tcp://localhost:12355",
+            world_size=1,
+            rank=0
+        )
+        print(f"✓ Distributed training initialized (backend: {backend})")
 
     # Build detector (this will initialize all modules including text adapters)
     print(f"Building detector with configuration from checkpoint...")
@@ -334,6 +351,8 @@ def main():
                         help='Number of HOI classes (600 or 117). If None, read from checkpoint.')
     parser.add_argument('--zs_type', type=str, default=None,
                         help='Zero-shot type. If None, read from checkpoint.')
+    parser.add_argument('--clip_model_path', type=str, default=None,
+                        help='Path to CLIP model (required if checkpoint has no args). Example: checkpoints/pretrained_CLIP/ViT-B-16.pt')
     parser.add_argument('--output_dir', type=str, default='hicodet_pkl_files',
                         help='Directory to save embeddings')
     parser.add_argument('--scale_factor', type=float, default=5.0,
@@ -362,20 +381,239 @@ def main():
     # Load checkpoint and training args
     checkpoint, ckpt_args = load_checkpoint_and_args(args.checkpoint)
 
+    # If checkpoint args missing, create from CLI args
     if ckpt_args is None:
-        raise ValueError(
-            "Cannot extract args from checkpoint. "
-            "Please ensure the checkpoint was saved with training arguments."
-        )
+        print("\nCreating configuration from command-line arguments...")
 
-    # Override checkpoint args with command-line args if provided
-    if args.num_classes is not None:
+        # Check required CLI arguments
+        if args.clip_model_path is None:
+            raise ValueError(
+                "Checkpoint missing args. Please provide --clip_model_path\n"
+                "Example: --clip_model_path checkpoints/pretrained_CLIP/ViT-B-16.pt"
+            )
+        if args.num_classes is None:
+            raise ValueError("Please provide --num_classes (117 or 600)")
+
+        # Create minimal args object from CLI
+        class MinimalArgs:
+            pass
+
+        ckpt_args = MinimalArgs()
+
+        # === BASIC CONFIGURATION ===
+        ckpt_args.dataset = 'hicodet'
         ckpt_args.num_classes = args.num_classes
-    if args.zs_type is not None:
-        ckpt_args.zs_type = args.zs_type
+        ckpt_args.zs = args.zs_type is not None
+        ckpt_args.zs_type = args.zs_type if args.zs_type else 'default'
+        ckpt_args.device = args.device
+
+        # === CLIP CONFIGURATION ===
+        ckpt_args.clip_dir_vit = args.clip_model_path
+        ckpt_args.clip_model_name = 'ViT-B/16' if 'ViT-B-16' in args.clip_model_path else 'ViT-L/14@336px'
+
+        # CLIP architecture - adjust based on model type
+        if 'ViT-B-16' in args.clip_model_path or 'ViT-B/16' in args.clip_model_path:
+            # ViT-B/16 architecture
+            ckpt_args.clip_visual_layers_vit = 12
+            ckpt_args.clip_visual_output_dim_vit = 512
+            ckpt_args.clip_visual_input_resolution_vit = 224
+            ckpt_args.clip_visual_width_vit = 768
+            ckpt_args.clip_visual_patch_size_vit = 16
+            ckpt_args.clip_text_transformer_width_vit = 512
+            ckpt_args.clip_text_transformer_heads_vit = 8
+            ckpt_args.clip_text_transformer_layers_vit = 12
+        else:
+            # ViT-L/14@336px architecture (default)
+            ckpt_args.clip_visual_layers_vit = 24
+            ckpt_args.clip_visual_output_dim_vit = 768
+            ckpt_args.clip_visual_input_resolution_vit = 336
+            ckpt_args.clip_visual_width_vit = 1024
+            ckpt_args.clip_visual_patch_size_vit = 14
+            ckpt_args.clip_text_transformer_width_vit = 768
+            ckpt_args.clip_text_transformer_heads_vit = 12
+            ckpt_args.clip_text_transformer_layers_vit = 12
+
+        ckpt_args.clip_text_context_length_vit = 77
+
+        # === PROMPT LEARNING ===
+        ckpt_args.N_CTX = 2  # Number of context vectors
+        ckpt_args.CTX_INIT = 'A photo of'  # Initialization words
+        ckpt_args.tune_LY = 9  # Number of layers to tune
+        ckpt_args.CSC = False  # Class-specific context
+        ckpt_args.CLASS_TOKEN_POSITION = 'end'
+        ckpt_args.use_templates = False
+
+        # === ADAPTER CONFIGURATION ===
+        ckpt_args.use_insadapter = True
+        ckpt_args.adapter_pos = 'all'
+        ckpt_args.adapter_num_layers = 1
+        ckpt_args.emb_dim = 64
+        ckpt_args.vis_embed_dim = 64
+
+        # === TEXT/IMAGE ALIGNMENT (based on hico_train_vitB_zs.sh) ===
+        ckpt_args.txt_align = True
+        ckpt_args.txtcls_pt = True
+        ckpt_args.img_align = True
+        ckpt_args.unseen_pt_inj = True
+        ckpt_args.img_clip_pt = True
+
+        # === TEXT PROMPT FLAGS ===
+        ckpt_args.seperate_pre_pt = False
+        ckpt_args.de_txtcls = False
+        ckpt_args.init_txtcls_pt = False
+        ckpt_args.deunify_pt = False
+        ckpt_args.fix_txt_pt = False
+        ckpt_args.txtcls_descrip = False
+        ckpt_args.img_descrip_prompt = False
+        ckpt_args.pt_begin_layer = 0
+
+        # === DESCRIPTOR/VLM ===
+        ckpt_args.act_descriptor = False
+        ckpt_args.vlmtxt = 'llava'
+
+        # === PREDICTION TYPE ===
+        ckpt_args.logits_type = 'HO'
+        ckpt_args.use_multi_hot = True
+
+        # === ZERO-SHOT SETTINGS ===
+        ckpt_args.fill_zs_verb_type = 0
+        ckpt_args.without_unseen_name = False
+        ckpt_args.finetune_allcls_utpl = False
+
+        # === PRIOR/INFERENCE ===
+        ckpt_args.prior_type = 'cbe'
+        ckpt_args.prior_method = 0
+        ckpt_args.vis_prompt_num = 50
+        ckpt_args.use_weight_pred = False
+        ckpt_args.box_proj = 0
+
+        # === TRAINING FLAGS ===
+        ckpt_args.eval = False
+        ckpt_args.use_distill = False
+        ckpt_args.use_consistloss = False
+        ckpt_args.pseudo_label = False
+        ckpt_args.tpt = False
+        ckpt_args.label_learning = False
+        ckpt_args.label_choice = 'random'
+        ckpt_args.use_mlp_proj = False
+
+        # === LANGUAGE AWARE ===
+        ckpt_args.LA = False
+        ckpt_args.LA_weight = 0.6
+
+        # === TESTING FLAGS ===
+        ckpt_args.clip_test = False
+        ckpt_args.use_gt_boxes = False
+        ckpt_args.self_image_path = None
+
+        # === FILES/PATHS ===
+        ckpt_args.file1 = None
+        ckpt_args.clip_img_file = None
+        ckpt_args.num_shot = 2
+
+        # === DETR CONFIGURATION ===
+        ckpt_args.d_detr = False
+        ckpt_args.pretrained = ''
+        ckpt_args.hidden_dim = 256
+        ckpt_args.repr_dim = 512
+        ckpt_args.enc_layers = 6
+        ckpt_args.dec_layers = 6
+        ckpt_args.dim_feedforward = 2048
+        ckpt_args.dropout = 0.1
+        ckpt_args.nheads = 8
+        ckpt_args.num_queries = 100
+        ckpt_args.pre_norm = False
+
+        # === DETR BACKBONE ===
+        ckpt_args.backbone = 'resnet50'
+        ckpt_args.dilation = False
+        ckpt_args.position_embedding = 'sine'
+        ckpt_args.position_embedding_scale = 2 * 3.14159265359  # 2 * pi
+        ckpt_args.num_feature_levels = 4
+        ckpt_args.lr_backbone = 2e-5
+        ckpt_args.masks = False
+
+        # === TRAINING PARAMETERS ===
+        ckpt_args.batch_size = 8
+        ckpt_args.weight_decay = 1e-4
+        ckpt_args.epochs = 20
+        ckpt_args.lr_drop = 10
+        ckpt_args.clip_max_norm = 0.1
+
+        # === LOSS COEFFICIENTS ===
+        ckpt_args.aux_loss = True
+        ckpt_args.set_cost_class = 1
+        ckpt_args.set_cost_bbox = 5
+        ckpt_args.set_cost_giou = 2
+        ckpt_args.bbox_loss_coef = 5
+        ckpt_args.giou_loss_coef = 2
+        ckpt_args.eos_coef = 0.1
+
+        # === LOSS COEFFICIENTS ===
+        ckpt_args.alpha = 0.5
+        ckpt_args.gamma = 0.2
+        ckpt_args.hyper_lambda = 2.8
+        ckpt_args.vis_tor = 1.0
+
+        # === DETECTION PARAMETERS ===
+        ckpt_args.human_idx = 49 if ckpt_args.dataset == 'hicodet' else 1
+        ckpt_args.box_score_thresh = 0.2
+        ckpt_args.fg_iou_thresh = 0.5
+        ckpt_args.min_instances = 3
+        ckpt_args.max_instances = 15
+
+        # === OTHER FLAGS ===
+        ckpt_args.multi_cross = False
+        ckpt_args.fix_mem = False
+        ckpt_args.txt_mem_init = False
+        ckpt_args.mem_adpt_self = False
+        ckpt_args.mem_sa_only = False
+        ckpt_args.feat_mask_type = 0
+        ckpt_args.origin_ctx = False
+
+        # === DIFFUSION BRIDGE (optional) ===
+        ckpt_args.use_diffusion_bridge = False
+        ckpt_args.diffusion_model_path = 'hoi_diffusion_results/model-300.pt'
+        ckpt_args.diffusion_text_mean = 'hicodet_pkl_files/hoi_text_mean_vitB_600.pkl'
+        ckpt_args.diffusion_inference_steps = 600
+
+        num_attrs = len(vars(ckpt_args))
+        print(f"✓ Created comprehensive configuration with {num_attrs} attributes:")
+        print(f"  Dataset: {ckpt_args.dataset}")
+        print(f"  Num classes: {ckpt_args.num_classes}")
+        print(f"  Zero-shot: {ckpt_args.zs} ({ckpt_args.zs_type})")
+        print(f"  CLIP model: {ckpt_args.clip_dir_vit}")
+        print(f"  CLIP architecture: {ckpt_args.clip_model_name}")
+        print(f"    - Visual layers: {ckpt_args.clip_visual_layers_vit}")
+        print(f"    - Visual output dim: {ckpt_args.clip_visual_output_dim_vit}")
+        print(f"    - Text transformer width: {ckpt_args.clip_text_transformer_width_vit}")
+        print(f"  Adaptation modules:")
+        print(f"    - Text align: {ckpt_args.txt_align}")
+        print(f"    - Text class prompts: {ckpt_args.txtcls_pt}")
+        print(f"    - Image align: {ckpt_args.img_align}")
+        print(f"    - Unseen prompt injection: {ckpt_args.unseen_pt_inj}")
+        print(f"    - Instance adapters: {ckpt_args.use_insadapter}")
+        print(f"  DETR: hidden_dim={ckpt_args.hidden_dim}, repr_dim={ckpt_args.repr_dim}")
+    else:
+        # Override checkpoint args with command-line args if provided
+        if args.num_classes is not None:
+            ckpt_args.num_classes = args.num_classes
+        if args.zs_type is not None:
+            ckpt_args.zs_type = args.zs_type
+        if args.clip_model_path is not None:
+            ckpt_args.clip_dir_vit = args.clip_model_path
 
     # Recreate model structure
-    model = recreate_model(ckpt_args, device=args.device)
+    try:
+        model = recreate_model(ckpt_args, device=args.device)
+    except AttributeError as e:
+        print(f"\n❌ ERROR: Missing attribute in ckpt_args")
+        print(f"   {e}")
+        print(f"\nCurrent ckpt_args attributes ({len(vars(ckpt_args))}):")
+        for attr in sorted(vars(ckpt_args).keys()):
+            print(f"  - {attr}: {getattr(ckpt_args, attr)}")
+        print(f"\nPlease report this error - the MinimalArgs may need additional attributes.")
+        raise
 
     # Load weights
     print("\nLoading model weights...")

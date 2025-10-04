@@ -1926,11 +1926,11 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
             print(f"Load weights for the object detector from {args.pretrained}")
             # pdb.set_trace()
         if 'e632da11' in args.pretrained:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model']) 
+            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model'])
         else:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
+            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model_state_dict'])
     
-    clip_state_dict = torch.load(clip_model_path, map_location="cpu").state_dict()
+    clip_state_dict = torch.load(clip_model_path, map_location="cpu", weights_only=False).state_dict()
     if args.clip_test is False:
         design_details = {"trainer": 'MaPLe',
                         "vision_depth": 0,
