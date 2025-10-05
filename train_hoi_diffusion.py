@@ -1,12 +1,22 @@
 """
-Train diffusion model on HOI text embeddings.
+Train diffusion model on HOI embeddings (text or visual).
 
-Adapted from diffusion-bridge/ddpm/train_norm.py but for HOI-specific text distribution.
+Adapted from diffusion-bridge/ddpm/train_norm.py but for HOI-specific distribution.
 
-Key differences:
-- Dataset: 600 HOI text embeddings vs 400k MSCOCO captions
-- Training steps: 300k vs 3M (smaller dataset converges faster)
-- Distribution: Structured HOI templates vs free-form captions
+Supported training modes:
+1. Text embeddings: 212 representative classes (adapted through learnable prompts)
+   - Limited data, may overfit
+   - Use only if you have no alternative
+
+2. Visual embeddings: 50k-100k human-object pairs from training images (RECOMMENDED)
+   - Abundant data, stable training
+   - Learns vision→text distribution bridging
+   - Extract using extract_visual_embeddings_for_diffusion.py
+
+Key differences from original diffusion-bridge:
+- Dataset: HOI-specific embeddings vs 400k MSCOCO captions
+- Training steps: 300k-500k vs 3M (depending on dataset size)
+- Distribution: Structured HOI distribution vs free-form captions
 """
 
 import torch
@@ -34,25 +44,71 @@ except ImportError:
 
 
 def load_hoi_embeddings(data_path):
-    """Load HOI text embeddings (already normalized by extract_hoi_text_embeddings.py)"""
-    print(f"Loading HOI text embeddings from: {data_path}")
+    """
+    Load HOI embeddings (text or visual).
+
+    Supports two formats:
+    1. Text embeddings: from extract_adapted_text_embeddings.py
+       - data['embeddings']: [212, embed_dim]
+       - data['num_classes']: number of classes
+
+    2. Visual embeddings: from extract_visual_embeddings_for_diffusion.py
+       - data['embeddings']: [N, embed_dim] where N = 50k-100k pairs
+       - data['metadata']: list of metadata dicts
+       - data['config']: extraction configuration
+    """
+    print(f"Loading HOI embeddings from: {data_path}")
 
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
 
-    embeddings = data['embeddings']  # [num_classes, embed_dim]
-    num_classes = data['num_classes']
-    clip_model = data['clip_model']
-    scale_factor = data.get('scale_factor', 5.0)
+    embeddings = data['embeddings']  # [num_samples, embed_dim]
 
-    print(f"  CLIP model: {clip_model}")
-    print(f"  Number of classes: {num_classes}")
+    # Ensure embeddings is a tensor
+    if isinstance(embeddings, np.ndarray):
+        embeddings = torch.from_numpy(embeddings)
+
+    # Detect embedding type
+    if 'metadata' in data:
+        # Visual embeddings
+        embedding_type = 'visual'
+        num_samples = len(embeddings)
+        config = data.get('config', {})
+        clip_model = config.get('clip_model', 'Unknown')
+        scale_factor = config.get('scale_factor', 5.0)
+
+        print(f"  Type: Visual embeddings (from training images)")
+        print(f"  CLIP model: {clip_model}")
+        print(f"  Number of samples: {num_samples:,}")
+        print(f"  Checkpoint: {config.get('checkpoint', 'Unknown')}")
+    else:
+        # Text embeddings
+        embedding_type = 'text'
+        num_samples = data.get('num_classes', len(embeddings))
+        clip_model = data.get('clip_model', 'Unknown')
+        scale_factor = data.get('scale_factor', 5.0)
+
+        print(f"  Type: Text embeddings (adapted HOI classes)")
+        print(f"  CLIP model: {clip_model}")
+        print(f"  Number of classes: {num_samples}")
+
     print(f"  Embedding shape: {embeddings.shape}")
     print(f"  Embedding dimension: {embeddings.shape[1]}")
     print(f"  Scale factor: {scale_factor}")
-    print(f"  Embedding norms (mean ± std): "
-          f"{embeddings.norm(dim=-1).mean().item():.4f} ± "
-          f"{embeddings.norm(dim=-1).std().item():.4f}")
+
+    # Compute statistics
+    if isinstance(embeddings, torch.Tensor):
+        norms = embeddings.norm(dim=-1)
+        print(f"  Embedding norms: {norms.mean().item():.4f} ± {norms.std().item():.4f}")
+        print(f"  Embedding range: [{embeddings.min().item():.4f}, {embeddings.max().item():.4f}]")
+    else:
+        norms = np.linalg.norm(embeddings, axis=-1)
+        print(f"  Embedding norms: {norms.mean():.4f} ± {norms.std():.4f}")
+        print(f"  Embedding range: [{embeddings.min():.4f}, {embeddings.max():.4f}]")
+
+    # Add embedding type to data info
+    data['embedding_type'] = embedding_type
+    data['num_samples'] = num_samples
 
     return embeddings.type(torch.float32), data
 
@@ -126,12 +182,12 @@ def setup_trainer(diffusion, dataset, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train diffusion model on HOI text embeddings')
+    parser = argparse.ArgumentParser(description='Train diffusion model on HOI embeddings (visual recommended, text also supported)')
 
     # Data paths
     parser.add_argument('--data_path', type=str,
-                        default='hicodet_pkl_files/hoi_text_embeddings_normalized_vitB_600.pkl',
-                        help='Path to normalized HOI text embeddings')
+                        default='hicodet_pkl_files/hoi_visual_embeddings_normalized_vitB_train.pkl',
+                        help='Path to normalized HOI embeddings (visual recommended, text also supported)')
 
     # Model architecture
     parser.add_argument('--init_dim', type=int, default=32,
@@ -151,8 +207,8 @@ def main():
                         help='Training batch size')
     parser.add_argument('--learning_rate', type=float, default=8e-5,
                         help='Learning rate')
-    parser.add_argument('--train_steps', type=int, default=300000,
-                        help='Total training steps (reduced from 3M for small dataset)')
+    parser.add_argument('--train_steps', type=int, default=500000,
+                        help='Total training steps (500k for visual, 300k for text)')
     parser.add_argument('--gradient_accumulate', type=int, default=1,
                         help='Gradient accumulation steps')
     parser.add_argument('--ema_decay', type=float, default=0.995,
@@ -216,7 +272,10 @@ def main():
     print(f"Monitor training in: {args.results_folder}/")
     print("\nTraining will take approximately:")
     print(f"  Steps: {args.train_steps:,}")
-    print(f"  Time: ~6-12 hours (depending on GPU)")
+    if data_info.get('embedding_type') == 'visual':
+        print(f"  Time: ~8-15 hours (visual embeddings, depending on GPU)")
+    else:
+        print(f"  Time: ~6-12 hours (text embeddings, depending on GPU)")
     print("="*60 + "\n")
 
     trainer.train()
@@ -226,8 +285,9 @@ def main():
     print("="*60)
     print(f"\nTrained model saved to: {args.results_folder}/")
     print(f"\nNext steps:")
-    print(f"1. Create diffusion bridge module using trained model")
-    print(f"2. Integrate into EZ-HOI for inference")
+    print(f"1. Test diffusion bridge: python test_visual_diffusion.py")
+    print(f"2. Integrate into EZ-HOI inference using DiffusionBridgeHOI module")
+    print(f"3. Update model checkpoint to enable diffusion_bridge parameter")
     print("="*60)
 
 

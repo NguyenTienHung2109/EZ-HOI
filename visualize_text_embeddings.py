@@ -2,12 +2,14 @@
 Visualize text and visual embeddings from trained EZ-HOI checkpoint.
 
 This script:
-1. Loads trained checkpoint and extracts text embeddings (600 HOI classes)
+1. Loads trained checkpoint and extracts text embeddings:
+   - RAW CLIP: 600 HOI classes from frozen CLIP encoder
+   - ADAPTED: 212 representative classes with learned prompts (from extract_adapted_text_embeddings.py)
 2. Loads cached CLIP visual features and creates visual prototypes per HOI:
    - Reads HICO annotations to map images -> HOI classes
    - Loads pre-extracted CLIP features from .pkl cache files
    - Pools features from all images containing each HOI interaction
-   - Creates [600, D] visual embedding matrix
+   - Creates [600, D] visual embedding matrix (filtered to [212, D] for adapted embeddings)
 3. Applies dimensionality reduction (PCA, t-SNE, UMAP)
 4. Creates 2 separate PNG visualizations:
 
@@ -42,6 +44,17 @@ Usage:
         --visual_cache_dir hicodet_pkl_files/clip336_img_hicodet_train \
         --num_seen_samples 30 \
         --num_unseen_samples 15
+
+    # Visualize ADAPTED text embeddings (212 representative classes) with visual embeddings
+    # This will sample 10 seen + 10 unseen and show text-visual pairs connected by lines
+    python visualize_text_embeddings.py \
+        --adapted_text_pkl hicodet_pkl_files/hoi_text_embeddings_adapted_unseen_verb_vitB_117_212classes_raw.pkl \
+        --zs_type unseen_verb \
+        --visual_cache_dir hicodet_pkl_files/clipbase_img_hicodet_train \
+        --annotation_file hicodet/trainval_hico.json \
+        --num_seen_samples 10 \
+        --num_unseen_samples 10 \
+        --checkpoint /data/hpc/hung/EZ-HOI/checkpoints/hico_HO_pt_default_vitbase/ckpt_426660_12.pt
 """
 
 import torch
@@ -70,8 +83,11 @@ except ImportError:
     print("Warning: UMAP not available. Install with: pip install umap-learn")
 
 import clip
-from hico_text_label import hico_text_label, hico_unseen_index, HICO_INTERACTIONS
+from hico_text_label import hico_text_label, hico_unseen_index, HICO_INTERACTIONS, HOI_TO_AO
 from hico_list import hico_verbs, hico_objects, hico_verbs_sentence
+
+# Create reverse mapping: hoi_id -> (verb_idx, obj_idx)
+# HOI_TO_AO is already defined in hico_text_label
 
 
 def load_checkpoint_info(checkpoint_path):
@@ -107,16 +123,42 @@ def extract_text_embeddings_from_checkpoint(checkpoint, args=None, cli_args=None
     """
     Extract text embeddings from checkpoint.
 
-    Three approaches:
-    1. If hoicls_txt is saved in checkpoint, use it directly
-    2. If we have args (from checkpoint or CLI), recreate embeddings from CLIP
-    3. Look for pre-computed embeddings in pkl files
+    Four approaches:
+    1. If adapted_text_pkl provided in CLI args, load adapted embeddings (212 classes)
+       Returns: (embeddings [212, D], select_HOI_index [212 HOI IDs])
+    2. If hoicls_txt is saved in checkpoint, use it directly (600 classes)
+       Returns: (embeddings [600, D], None)
+    3. If we have args (from checkpoint or CLI), recreate embeddings from CLIP
+       Returns: (embeddings [600, D], None)
+    4. Look for pre-computed embeddings in pkl files
+       Returns: (embeddings [600, D], None)
+
+    Returns:
+        tuple: (embeddings, select_HOI_index)
+            - embeddings: numpy array of shape [N, D] where N is 212 or 600
+            - select_HOI_index: list of N HOI IDs (integers 0-599) if adapted, else None
     """
     print(f"\n{'='*60}")
     print("Extracting Text Embeddings")
     print('='*60)
 
-    # Approach 1: Check if embeddings are saved in checkpoint
+    # Approach 1: Load adapted embeddings if provided
+    if cli_args and cli_args.adapted_text_pkl:
+        print(f"\n✓ Loading ADAPTED text embeddings from: {cli_args.adapted_text_pkl}")
+        with open(cli_args.adapted_text_pkl, 'rb') as f:
+            data = pickle.load(f)
+
+        embeddings = data['embeddings']  # [212, 512] numpy array
+        select_HOI_index = data['select_HOI_index']  # List of 212 HOI IDs (integers 0-599)
+
+        print(f"  Loaded adapted embeddings: {embeddings.shape}")
+        print(f"  Number of representative classes: {len(select_HOI_index)}")
+        print(f"  Embedding dimension: {embeddings.shape[1]}")
+
+        # Return both embeddings and select_HOI_index
+        return embeddings, select_HOI_index
+
+    # Approach 2: Check if embeddings are saved in checkpoint
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
 
@@ -130,7 +172,7 @@ def extract_text_embeddings_from_checkpoint(checkpoint, args=None, cli_args=None
         if 'hoicls_txt' in state_dict:
             print("\n✓ Found hoicls_txt in checkpoint")
             embeddings = state_dict['hoicls_txt']
-            return embeddings.cpu().numpy()
+            return embeddings.cpu().numpy(), None  # No select_HOI_index for raw embeddings
 
     # Approach 2: Load from pre-computed embeddings or recreate
     print("\n⚠ hoicls_txt not found in checkpoint, will recreate from CLIP")
@@ -209,7 +251,7 @@ def extract_text_embeddings_from_checkpoint(checkpoint, args=None, cli_args=None
     print(f"  Embedding shape: {text_embeddings.shape}")
     print(f"  Embedding norm (mean ± std): {text_embeddings.norm(dim=-1).mean().item():.4f} ± {text_embeddings.norm(dim=-1).std().item():.4f}")
 
-    return text_embeddings.cpu().numpy()
+    return text_embeddings.cpu().numpy(), None  # No select_HOI_index for raw embeddings
 
 
 def get_class_labels(num_classes, zs_type=None):
@@ -518,6 +560,10 @@ def print_embedding_analysis(embeddings, labels, unseen_indices=None, top_k=10):
     print("Embedding Analysis")
     print('='*60)
 
+    # Ensure embeddings is numpy array
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.cpu().numpy()
+
     # Basic statistics
     norms = np.linalg.norm(embeddings, axis=1)
     print(f"\nEmbedding Statistics:")
@@ -537,17 +583,28 @@ def print_embedding_analysis(embeddings, labels, unseen_indices=None, top_k=10):
     print(f"  Mean: {similarities.mean():.4f}, Std: {similarities.std():.4f}")
     print(f"  Min: {similarities.min():.4f}, Max: {similarities.max():.4f}")
 
+    # Clamp top_k to available pairs
+    num_pairs = len(similarities)
+    actual_top_k = min(top_k, num_pairs)
+
     # Find most similar pairs
-    print(f"\nTop {top_k} Most Similar Class Pairs:")
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    print(f"\nTop {actual_top_k} Most Similar Class Pairs:")
+    if num_pairs > 0:
+        sorted_indices = np.argsort(similarities)
+        top_indices = sorted_indices[-actual_top_k:][::-1]
+    else:
+        top_indices = np.array([])
     for rank, idx in enumerate(top_indices, 1):
         i, j = triu_indices[0][idx], triu_indices[1][idx]
         sim = similarities[idx]
         print(f"  {rank}. {labels[i]} <-> {labels[j]}: {sim:.4f}")
 
     # Find most dissimilar pairs
-    print(f"\nTop {top_k} Most Dissimilar Class Pairs:")
-    bottom_indices = np.argsort(similarities)[:top_k]
+    print(f"\nTop {actual_top_k} Most Dissimilar Class Pairs:")
+    if num_pairs > 0:
+        bottom_indices = sorted_indices[:actual_top_k]
+    else:
+        bottom_indices = np.array([])
     for rank, idx in enumerate(bottom_indices, 1):
         i, j = triu_indices[0][idx], triu_indices[1][idx]
         sim = similarities[idx]
@@ -707,6 +764,8 @@ def main():
                        help='Show text labels on plots')
     parser.add_argument('--output_dir', type=str, default='visualizations',
                        help='Directory to save visualizations')
+    parser.add_argument('--adapted_text_pkl', type=str, default=None,
+                       help='Path to adapted text embeddings .pkl from extract_adapted_text_embeddings.py. If provided, uses adapted embeddings instead of raw CLIP.')
     parser.add_argument('--compare_raw', action='store_true',
                        help='Also visualize raw CLIP embeddings for comparison')
     parser.add_argument('--print_embeddings', action='store_true',
@@ -733,14 +792,35 @@ def main():
             zs_type = ckpt_args.zs_type if hasattr(ckpt_args, 'zs_type') else None
 
     # Extract text embeddings - pass both checkpoint args and CLI args
-    text_embeddings = extract_text_embeddings_from_checkpoint(checkpoint, ckpt_args, args)
+    text_embeddings, select_HOI_index = extract_text_embeddings_from_checkpoint(checkpoint, ckpt_args, args)
 
-    # Extract visual embeddings from cache files
+    # Extract visual embeddings from cache files (always extract all 600 first)
     visual_embeddings = extract_visual_embeddings_from_cache(
         cache_dir=args.visual_cache_dir,
         annotation_file=args.annotation_file,
-        num_classes=num_classes
+        num_classes=600  # Always extract all 600 classes
     )
+
+    # If using adapted embeddings, filter visual embeddings to match 212 representative classes
+    if select_HOI_index is not None:
+        print(f"\n{'='*60}")
+        print("Filtering Visual Embeddings for Adapted Text Embeddings")
+        print('='*60)
+
+        # select_HOI_index is already a list of HOI IDs (integers 0-599), NOT tuples!
+        select_hoi_ids = select_HOI_index
+        print(f"  Representative classes: {len(select_hoi_ids)}")
+        print(f"  Example HOI IDs: {select_hoi_ids[:10]}")
+
+        # Filter visual embeddings to match
+        if visual_embeddings is not None:
+            print(f"  Before filtering: {visual_embeddings.shape}")
+            visual_embeddings = visual_embeddings[select_hoi_ids]
+            print(f"  After filtering: {visual_embeddings.shape}")
+
+        # Update num_classes to match filtered embeddings
+        num_classes = len(select_HOI_index)
+        print(f"✓ Updated num_classes to {num_classes} (representative classes)")
 
     # Check if visual embeddings were loaded
     if visual_embeddings is not None:
@@ -753,7 +833,23 @@ def main():
         print(f"    3. Cache files (.pkl) are present in the directory")
 
     # Get labels
-    labels, label_type, unseen_indices = get_class_labels(num_classes, zs_type)
+    if select_HOI_index is not None:
+        # For adapted embeddings, create labels from select_HOI_index (list of HOI IDs)
+        # Convert HOI IDs → tuples to access hico_text_label
+        labels = [hico_text_label[HOI_TO_AO[hoi_id]] for hoi_id in select_HOI_index]
+        label_type = 'hoi'
+
+        # Update unseen_indices to work with filtered 212 classes
+        if zs_type and zs_type in hico_unseen_index:
+            original_unseen = hico_unseen_index[zs_type]
+            # Find which positions in select_HOI_index contain unseen HOI IDs
+            unseen_indices = [i for i, hoi_id in enumerate(select_HOI_index) if hoi_id in original_unseen]
+            print(f"\n✓ Found {len(unseen_indices)} unseen classes in representative set (out of {len(select_HOI_index)})")
+        else:
+            unseen_indices = []
+    else:
+        # For raw embeddings (600 classes), use existing logic
+        labels, label_type, unseen_indices = get_class_labels(num_classes, zs_type)
 
     # Use text embeddings as default
     embeddings = text_embeddings

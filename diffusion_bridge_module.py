@@ -160,28 +160,53 @@ class DiffusionBridgeHOI(nn.Module):
         return diffusion
 
     def _load_text_mean(self, text_mean_path):
-        """Load HOI text mean for normalization"""
+        """
+        Load HOI text mean for normalization.
+
+        Supports two formats:
+        1. Old format: Just a tensor [embed_dim]
+        2. New format: Dict with 'text_mean' key and metadata
+        """
         if not Path(text_mean_path).exists():
             raise FileNotFoundError(
                 f"Text mean not found: {text_mean_path}\n"
-                f"Please run extract_hoi_text_embeddings.py first"
+                f"Please run extract_adapted_text_embeddings.py first"
             )
 
         if self.verbose:
             print(f"\nLoading text mean from: {text_mean_path}")
 
         with open(text_mean_path, 'rb') as f:
-            text_mean = pickle.load(f)
+            data = pickle.load(f)
+
+        # Handle both formats
+        if isinstance(data, dict):
+            # New format with metadata
+            text_mean = data['text_mean']
+            if self.verbose:
+                print(f"  Source: {data.get('source', 'unknown')}")
+                print(f"  Num classes: {data.get('num_classes', 'unknown')}")
+                print(f"  CLIP model: {data.get('clip_model', 'unknown')}")
+        else:
+            # Old format: just tensor
+            text_mean = data
+            if self.verbose:
+                print(f"  Source: legacy format (raw CLIP embeddings)")
 
         # Ensure it's a tensor
         if not isinstance(text_mean, torch.Tensor):
             text_mean = torch.tensor(text_mean)
+
+        # Ensure correct shape (should be 1D: [embed_dim])
+        if text_mean.dim() == 2 and text_mean.shape[0] == 1:
+            text_mean = text_mean.squeeze(0)
 
         # Register as buffer (moves with model to GPU, but not trained)
         self.register_buffer('_text_mean_buffer', text_mean)
 
         if self.verbose:
             print(f"  ✓ Loaded text mean (shape: {text_mean.shape})")
+            print(f"  Text mean norm: {text_mean.norm().item():.6f}")
 
         return text_mean
 

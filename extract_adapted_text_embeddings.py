@@ -4,19 +4,22 @@ Extract ADAPTED text embeddings from trained EZ-HOI model.
 This script:
 1. Loads a trained EZ-HOI checkpoint
 2. Recreates the model structure with all configurations
-3. Forward passes text through learned adapters (txtmem_adapter, act_descriptor_attn)
-4. Extracts ADAPTED text embeddings (after all modifications)
-5. Applies diffusion-bridge normalization strategy
-6. Saves embeddings for diffusion training
+3. **CRITICAL**: Forwards text through clip_head.prompt_learner (learnable prompts)
+4. Forwards through clip_head.text_encoder to get embeddings WITH learned prompts
+5. Applies additional adapters (txtmem_adapter, act_descriptor_attn) if enabled
+6. Applies diffusion-bridge normalization strategy
+7. Saves 212 representative class embeddings (not 600 with zeros)
 
-Key insight: Text embeddings in EZ-HOI are modified by learnable modules during training.
-Diffusion should be trained on these ADAPTED embeddings, not raw CLIP embeddings, to ensure
-vision-text alignment consistency at inference time.
+Key insights:
+- model.hoicls_txt = RAW CLIP embeddings (from fixed_clip_model at initialization)
+- During inference, text goes through LEARNABLE PROMPTS (txtcls_pt=True)
+- This creates ADAPTED embeddings different from raw CLIP
+- Diffusion MUST train on ADAPTED embeddings to match inference behavior
 
 Usage:
     python extract_adapted_text_embeddings.py \
         --checkpoint checkpoints/hico_HO_pt_default_vitbase/best.pth \
-        --num_classes 600 \
+        --num_classes 117 \
         --zs_type unseen_verb \
         --output_dir hicodet_pkl_files
 """
@@ -123,28 +126,71 @@ def recreate_model(args, device='cuda'):
 
 def extract_adapted_embeddings(model, device='cuda'):
     """
-    Extract adapted text embeddings from the model.
+    Extract adapted text embeddings from the trained model.
 
     Flow:
-    1. Get initial HOI text embeddings (hoicls_txt)
-    2. If txt_align: Apply txtmem_adapter
-    3. If act_descriptor: Apply act_descriptor_attn
-    4. Return final adapted embeddings
+    1. Forward text through clip_head.prompt_learner() to get learnable prompts
+    2. Forward through clip_head.text_encoder() to get embeddings WITH learned prompts
+    3. If txt_align: Apply txtmem_adapter
+    4. If act_descriptor: Apply act_descriptor_attn
+    5. Return final adapted embeddings
+
+    Key difference from raw CLIP:
+    - model.hoicls_txt = raw CLIP embeddings (from fixed_clip_model)
+    - This function extracts embeddings AFTER learnable prompt adaptation
     """
     print("\n" + "="*60)
     print("Extracting adapted text embeddings...")
     print("="*60)
 
     with torch.no_grad():
-        # Get initial text embeddings (already loaded in model during build_detector)
-        hoicls_txt = model.hoicls_txt.to(device)  # [num_classes, embed_dim]
+        # Get metadata
+        hoicls_txt = model.hoicls_txt.to(device)  # [600, 512] - Raw CLIP embeddings
         select_HOI_index = model.select_HOI_index
 
-        # Select relevant classes
-        hoitxt_features = hoicls_txt[select_HOI_index]  # [selected_classes, embed_dim]
-
-        print(f"\nInitial embeddings shape: {hoitxt_features.shape}")
+        print(f"\nExtracting adapted embeddings through learnable prompts...")
         print(f"Number of selected classes: {len(select_HOI_index)}")
+
+        # CRITICAL: Forward through prompt_learner to get ADAPTED embeddings
+        # This applies learnable prompts that were trained with the model
+        if model.txtcls_pt:
+            print(f"✓ Using learnable text class prompts (txtcls_pt=True)")
+
+            # Temporarily disable img_clip_pt (only affects visual prompts, not text)
+            # This avoids needing filenames parameter which is only used for visual prompts
+            original_img_clip_pt = model.clip_head.prompt_learner.img_clip_pt
+            model.clip_head.prompt_learner.img_clip_pt = False
+
+            prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision, txtcls_pt_list, origin_ctx = \
+                model.clip_head.prompt_learner(
+                    img_descrip_priors=None,
+                    txtcls_feat=hoicls_txt,
+                    select_HOI_index=select_HOI_index,
+                    unseen_text_priors=model.unseen_text_priors,
+                    filenames=None  # Safe now since img_clip_pt=False
+                )
+
+            # Restore original value
+            model.clip_head.prompt_learner.img_clip_pt = original_img_clip_pt
+
+            # Encode text with learned prompts
+            tokenized_prompts = model.clip_head.tokenized_prompts
+            txtcls_feat = hoicls_txt[select_HOI_index] if model.txtcls_descrip else None
+
+            hoitxt_features, origin_txt_features = model.clip_head.text_encoder(
+                prompts,
+                tokenized_prompts,
+                deep_compound_prompts_text,
+                txtcls_feat=txtcls_feat,
+                txtcls_pt_list=txtcls_pt_list,
+                origin_ctx=origin_ctx
+            )
+            print(f"✓ Obtained embeddings after learnable prompts")
+        else:
+            print(f"✗ No learnable prompts (txtcls_pt=False), using raw CLIP embeddings")
+            hoitxt_features = hoicls_txt[select_HOI_index]
+
+        print(f"\nAdapted embeddings shape: {hoitxt_features.shape}")
         print(f"Embedding dimension: {hoitxt_features.shape[1]}")
 
         # Apply text adapter if enabled
@@ -168,16 +214,11 @@ def extract_adapted_embeddings(model, device='cuda'):
         else:
             print(f"\n✗ Action descriptor attention disabled")
 
-        # Map back to full 600 classes if needed
-        if len(select_HOI_index) < len(hoicls_txt):
-            print(f"\n✓ Mapping selected classes back to full {len(hoicls_txt)} classes...")
-            full_embeddings = torch.zeros_like(hoicls_txt)
-            full_embeddings[select_HOI_index] = adapted_features
-            final_embeddings = full_embeddings
-        else:
-            final_embeddings = adapted_features
+        # Keep only 212 representative classes (no zero-filling)
+        final_embeddings = adapted_features
 
         print(f"\nFinal adapted embeddings shape: {final_embeddings.shape}")
+        print(f"Number of representative classes: {len(select_HOI_index)}")
         print(f"Embedding norms (mean ± std): {final_embeddings.norm(dim=-1).mean().item():.4f} ± {final_embeddings.norm(dim=-1).std().item():.4f}")
 
     return final_embeddings.cpu(), select_HOI_index
@@ -259,6 +300,9 @@ def save_embeddings(raw_embeddings, text_mean, normalized_embeddings,
 
     suffix = f"{suffix}_{args.num_classes}"
 
+    # Add number of representative classes
+    suffix = f"{suffix}_{len(select_HOI_index)}classes"
+
     # Add additional identifier for adapted embeddings
     if args.zs:
         suffix = f"adapted_{args.zs_type}_{suffix}"
@@ -298,11 +342,25 @@ def save_embeddings(raw_embeddings, text_mean, normalized_embeddings,
         }, f)
     print(f"✓ Saved normalized embeddings to: {norm_path}")
 
-    # Save text mean
+    # Save text mean (with metadata for easier loading)
     mean_path = output_dir / f'hoi_text_mean_{suffix}.pkl'
     with open(mean_path, 'wb') as f:
-        pickle.dump(text_mean, f)
+        pickle.dump({
+            'text_mean': text_mean.squeeze(0),  # Remove batch dimension [1, 512] -> [512]
+            'num_classes': len(select_HOI_index),
+            'select_HOI_index': select_HOI_index,
+            'scale_factor': 5.0,
+            'clip_model': suffix.replace('adapted_', '').split('_')[0],  # Extract vitB/vitL
+            'source': 'adapted_embeddings',
+            'checkpoint': args.checkpoint
+        }, f)
     print(f"✓ Saved text mean to: {mean_path}")
+
+    # Save select_HOI_index mapping (for reference)
+    index_path = output_dir / f'select_HOI_index_{suffix}.pkl'
+    with open(index_path, 'wb') as f:
+        pickle.dump(select_HOI_index, f)
+    print(f"✓ Saved select_HOI_index to: {index_path}")
 
     # Save summary
     summary_path = output_dir / f'hoi_text_embeddings_{suffix}_summary.txt'
@@ -310,13 +368,18 @@ def save_embeddings(raw_embeddings, text_mean, normalized_embeddings,
         f.write("Adapted HOI Text Embeddings Summary\n")
         f.write("="*60 + "\n\n")
         f.write(f"Checkpoint: {args.resume if hasattr(args, 'resume') else 'unknown'}\n")
-        f.write(f"Number of classes: {args.num_classes}\n")
-        f.write(f"Selected classes: {len(select_HOI_index)}\n")
+        f.write(f"Number of action classes: {args.num_classes}\n")
+        f.write(f"Number of representative HOI classes: {len(select_HOI_index)} (out of 600 total)\n")
         f.write(f"Embedding dimension: {raw_embeddings.shape[1]}\n")
         f.write(f"Scale factor: 5.0\n\n")
-        f.write("Adaptation modules applied:\n")
-        f.write(f"  - Text align (txtmem_adapter): {args.txt_align}\n")
-        f.write(f"  - Text class prompts: {args.txtcls_pt}\n")
+        f.write(f"Note: These are the {len(select_HOI_index)} representative HOI classes\n")
+        f.write(f"selected during model training based on similarity/diversity.\n")
+        f.write(f"See select_HOI_index_{suffix}.pkl for the exact indices.\n\n")
+        f.write("Adaptation pipeline:\n")
+        f.write(f"  1. Learnable prompts (txtcls_pt): {args.txtcls_pt}\n")
+        f.write(f"     → Text forwarded through clip_head.prompt_learner + text_encoder\n")
+        f.write(f"     → Embeddings AFTER learned prompt adaptation\n")
+        f.write(f"  2. Text align adapter (txtmem_adapter): {args.txt_align}\n")
         f.write(f"  - Action descriptor: {args.act_descriptor if hasattr(args, 'act_descriptor') else False}\n")
         f.write(f"  - VLM text: {args.vlmtxt if hasattr(args, 'vlmtxt') else 'None'}\n\n")
         f.write(f"Text mean norm: {text_mean.norm().item():.6f}\n")
@@ -333,6 +396,7 @@ def save_embeddings(raw_embeddings, text_mean, normalized_embeddings,
         'raw_path': raw_path,
         'norm_path': norm_path,
         'mean_path': mean_path,
+        'index_path': index_path,
         'summary_path': summary_path
     }
 
@@ -451,7 +515,7 @@ def main():
         ckpt_args.vis_embed_dim = 64
 
         # === TEXT/IMAGE ALIGNMENT (based on hico_train_vitB_zs.sh) ===
-        ckpt_args.txt_align = True
+        ckpt_args.txt_align = False  # Training script has NO --txt_align flag (defaults to False)
         ckpt_args.txtcls_pt = True
         ckpt_args.img_align = True
         ckpt_args.unseen_pt_inj = True
