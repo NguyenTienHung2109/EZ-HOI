@@ -1270,6 +1270,11 @@ class UPT(nn.Module):
             else:
                 adapter_feat = vis_feat
 
+            # ========== EXTRACTION HOOK (for visualization) ========== ↓
+            if hasattr(self, 'extraction_mode') and self.extraction_mode:
+                self._extracted_visual_feat = adapter_feat.detach().cpu()
+            # ========================================================== ↑
+
             # Apply diffusion bridge (ONLY at inference, to bridge vision→text gap)
             if self.diffusion_bridge is not None and not self.training:
                 adapter_feat = self.diffusion_bridge(adapter_feat)
@@ -1701,8 +1706,19 @@ class UPT(nn.Module):
                 txtcls_pt_list = None
             hoitxt_features, origin_txt_features = self.clip_head.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text, txtcls_feat, txtcls_pt_list, origin_ctx)
 
+            # ========== EXTRACTION HOOK (for visualization) ========== ↓
+            if hasattr(self, 'extraction_mode') and self.extraction_mode:
+                self._extracted_text_feat = hoitxt_features.detach().cpu()
+            # ========================================================== ↑
+
         else:
             hoitxt_features = self.hoicls_txt[self.select_HOI_index].to(device)
+
+            # ========== EXTRACTION HOOK (for visualization, alternative path) ========== ↓
+            if hasattr(self, 'extraction_mode') and self.extraction_mode:
+                self._extracted_text_feat = hoitxt_features.detach().cpu()
+            # =========================================================================== ↑
+
             if self.fix_txt_pt is True:
                 tokenized_prompts = self.clip_head.tokenized_prompts
                 _, shared_ctx, _, deep_compound_prompts_vision,_ = \
