@@ -1,0 +1,61 @@
+# Diffusion Bridge Configuration
+# This config file specifies paths and parameters for the frozen diffusion bridge
+# pretrained on MS-COCO for vision-text modality alignment.
+
+# ============================================================
+# REQUIRED: Update these paths to your actual files
+# ============================================================
+
+# Path to your frozen MS-COCO diffusion checkpoint
+# This should be the .pt file saved from your COCO diffusion training
+model_path: 'path/to/your/coco_diffusion_checkpoint.pt'
+
+# Path to COCO text mean (from COCO diffusion training)
+# This MUST be the same text_mean used when training the diffusion model
+# Shape should be [512] for ViT-B/16 or [768] for ViT-L/14
+text_mean_path: 'path/to/your/coco_text_mean.pkl'
+
+# ============================================================
+# Diffusion Sampling Steps
+# ============================================================
+
+# Number of DDIM steps during training
+# Lower = faster training (recommended: 50-100)
+# Higher = better alignment but slower (100-200)
+training_steps: 100
+
+# Number of DDIM steps during inference/evaluation
+# Lower = faster inference (300-600)
+# Higher = better quality (600-1000)
+inference_steps: 600
+
+# ============================================================
+# Diffusion Parameters
+# ============================================================
+
+# Scale factor for diffusion normalization
+# This should match what was used during COCO diffusion training
+# Typical values: 1.0, 5.0, 10.0
+scale_factor: 5.0
+
+# ============================================================
+# Notes
+# ============================================================
+#
+# 1. The diffusion checkpoint must match your CLIP model:
+#    - ViT-B/16 diffusion → use with --clip_dir_vit ViT-B-16.pt
+#    - ViT-L/14 diffusion → use with --clip_dir_vit ViT-L-14-336px.pt
+#
+# 2. The text_mean MUST come from the same COCO training:
+#    - DO NOT recompute it separately
+#    - It should have been saved during diffusion training
+#    - If missing, see TRAINING_GUIDE.md for reconstruction steps
+#
+# 3. Training will be 2-3x slower with diffusion enabled:
+#    - Reduce training_steps to 50 for faster training
+#    - Use inference_steps=1000 for best quality results
+#
+# 4. Example paths (update with your actual paths):
+#    model_path: 'coco_diffusion_results/model-300.pt'
+#    text_mean_path: 'coco_diffusion_results/coco_text_mean.pkl'
+#

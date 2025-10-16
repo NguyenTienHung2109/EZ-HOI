@@ -1,3 +1,15 @@
+#!/bin/bash
+# HICO-DET training with ViT-B/16 (Zero-shot unseen verb setting)
+#
+# IMPORTANT: Do NOT use --txt_align flag!
+# When using diffusion bridge for modality alignment, text adapter is harmful.
+# The diffusion bridge converts vision features to raw CLIP text distribution,
+# so text embeddings must remain as raw CLIP outputs (no adapter).
+#
+# To enable diffusion bridge, add:
+#   --use_diffusion_bridge \
+#   --diffusion_config configs/diffusion_bridge_config.yaml \
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_tip_finetune.py --world-size 4 \
  --pretrained "checkpoints/detr-r50-hicodet.pth" \
  --output-dir checkpoints/hico_HO_pt_default_vitbase/ \
@@ -9,4 +21,3 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main_tip_finetune.py --world-size 4 \
  --zs --zs_type "unseen_verb" \
  --clip_img_file   hicodet_pkl_files/clipbase_img_hicodet_train \
 
- 

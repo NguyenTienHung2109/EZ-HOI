@@ -249,6 +249,45 @@ class DiffusionBridgeHOI(nn.Module):
 
         return x_bridged
 
+    @torch.no_grad()
+    def apply_diffusion_only(self, features, inference_steps=None):
+        """
+        Apply ONLY the diffusion sampling part (not the geometric normalization).
+        Assumes features are already in diffusion-normalized space via DiffusionGeometricTransform.
+
+        This method is used during training/inference when features have already been
+        geometrically transformed (L2 norm -> subtract mean -> L2 norm).
+
+        Args:
+            features: [batch, embed_dim] - already geometrically normalized
+            inference_steps: Number of DDIM steps (overrides self.inference_steps if provided)
+
+        Returns:
+            refined_features: [batch, embed_dim] - diffusion-refined, L2 normalized
+        """
+        if inference_steps is None:
+            inference_steps = self.inference_steps
+
+        # Features are already: L2_norm -> subtract_mean -> L2_norm
+        # Now apply: scale -> diffusion -> normalize
+
+        # Step 1: Scale by factor (amplify signal for diffusion)
+        x = features * self.scale_factor
+
+        # Step 2: Add channel dimension for 1D convolution
+        x = x.unsqueeze(1)  # [batch, 1, embed_dim]
+
+        # Step 3: Apply DDIM sampling (refine toward text distribution)
+        x_bridged = self.diffusion.ddim_sample_with_img(x, inference_step=inference_steps)
+
+        # Step 4: Remove channel dimension
+        x_bridged = x_bridged.squeeze(1)  # [batch, embed_dim]
+
+        # Step 5: Normalize back to unit sphere
+        x_bridged = F.normalize(x_bridged, dim=-1)
+
+        return x_bridged
+
     def extra_repr(self):
         """String representation for printing model"""
         return (f"inference_steps={self.inference_steps}, "

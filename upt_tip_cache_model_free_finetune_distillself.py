@@ -271,6 +271,46 @@ class Weight_Pred(nn.Module):
         x = self.linear2(x)
         return F.sigmoid(x)
 
+class DiffusionGeometricTransform(nn.Module):
+    """
+    Applies the geometric transformation used by diffusion bridge.
+    This is differentiable and puts features into the coordinate space
+    where the diffusion model operates.
+
+    Transformation pipeline:
+    1. L2 normalize to unit sphere
+    2. Subtract HOI text mean (shifts distribution center)
+    3. L2 normalize again (project back to unit sphere)
+
+    This creates a new coordinate system on the unit sphere where
+    diffusion-refined vision features and text features can be meaningfully compared.
+
+    NOTE: This is applied to BOTH vision and text features for alignment,
+    but only vision features go through subsequent diffusion sampling.
+    """
+    def __init__(self, text_mean):
+        super().__init__()
+        # Register text_mean as buffer (moves with model to GPU, but not trained)
+        self.register_buffer('text_mean', text_mean)
+
+    def forward(self, features):
+        """
+        Args:
+            features: [N, D] embeddings (either vision or text)
+        Returns:
+            transformed_features: [N, D] embeddings in diffusion coordinate space
+        """
+        # Step 1: L2 normalize to unit sphere
+        features = F.normalize(features, dim=-1)
+
+        # Step 2: Subtract text mean (key geometric shift!)
+        features = features - self.text_mean
+
+        # Step 3: Renormalize to unit sphere (new coordinate system)
+        features = F.normalize(features, dim=-1)
+
+        return features
+
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -875,16 +915,31 @@ class UPT(nn.Module):
                     scale_factor=diffusion_config.get('scale_factor', 5.0),
                     verbose=True
                 )
+
+                # Initialize geometric transform module (shared for vision and text)
+                # Extract text_mean from diffusion bridge for coordinate alignment
+                text_mean = self.diffusion_bridge._text_mean_buffer
+                self.diffusion_geometric_transform = DiffusionGeometricTransform(text_mean)
+
+                # Store training/inference step configuration
+                self.diffusion_training_steps = diffusion_config.get('training_steps', 100)
+                self.diffusion_inference_steps = diffusion_config.get('inference_steps', 600)
+
                 print(f"✓ Diffusion bridge initialized and ready")
-                print(f"  Mode: Inference-only (frozen weights)")
-                print(f"  Integration point: After image adapter, before classification")
+                print(f"  Mode: Training + Inference (frozen diffusion weights)")
+                print(f"  Training steps: {self.diffusion_training_steps}")
+                print(f"  Inference steps: {self.diffusion_inference_steps}")
+                print(f"  Geometric transform: Shared for vision and text")
+                print(f"  Integration point: After adapters, before classification")
                 print(f"{'='*60}\n")
             else:
                 print("Warning: use_diffusion_bridge=True but no diffusion_config provided")
                 print("Diffusion bridge will not be used.")
                 self.diffusion_bridge = None
+                self.diffusion_geometric_transform = None
         else:
             self.diffusion_bridge = None
+            self.diffusion_geometric_transform = None
 
         # self.unseen_verb_idxs = []
         self.label_choice = args.label_choice
@@ -892,8 +947,13 @@ class UPT(nn.Module):
         self.txt_align = args.txt_align
         if args.img_align is True:
             self.mem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
-        if args.txt_align is True:
-            self.txtmem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
+
+        # Text adapter REMOVED when using diffusion bridge
+        # Reason: Diffusion bridge converts vision features to raw CLIP text distribution.
+        # Text adapter would transform text away from this target distribution, causing misalignment.
+        # When using diffusion bridge, text embeddings should remain as raw CLIP outputs.
+        # if args.txt_align is True:
+        #     self.txtmem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
         self.select_HOI_index = kwargs['select_HOI_index']
         self.one_hots_HO, self.sample_lens_HO = self.load_cache_model(file1=file1, feature='hum_obj',num_classes=self.num_classes, num_shot=num_shot, filtered_hoi_idx = self.filtered_hoi_idx, 
                                                                                             use_multi_hot=self.use_multi_hot, label_choice=self.label_choice, num_anno=self.num_anno,
@@ -1275,14 +1335,37 @@ class UPT(nn.Module):
                 self._extracted_visual_feat = adapter_feat.detach().cpu()
             # ========================================================== ↑
 
-            # Apply diffusion bridge (ONLY at inference, to bridge vision→text gap)
-            if self.diffusion_bridge is not None and not self.training:
-                adapter_feat = self.diffusion_bridge(adapter_feat)
+            # ========== DIFFUSION BRIDGE INTEGRATION ========== ↓
+            # Apply diffusion-based modality alignment (vision→text)
+            if self.diffusion_geometric_transform is not None:
+                # Step 1: Apply geometric transform to BOTH vision and text
+                # This puts both modalities in the same coordinate space where diffusion operates
+                adapter_feat = self.diffusion_geometric_transform(adapter_feat)
+                adapt_hoitxt_features = self.diffusion_geometric_transform(hoitxt_features)
 
-            if self.txt_align is True:
-                adapt_hoitxt_features = self.txtmem_adapter(hoitxt_features.unsqueeze(0)).squeeze(0)
+                # Step 2: Apply diffusion sampling ONLY to vision features
+                # Text features are already in target distribution, no diffusion needed
+                if self.training:
+                    # Training: use fewer steps for speed
+                    adapter_feat = self.diffusion_bridge.apply_diffusion_only(
+                        adapter_feat,
+                        inference_steps=self.diffusion_training_steps
+                    )
+                else:
+                    # Inference: use full steps for quality
+                    adapter_feat = self.diffusion_bridge.apply_diffusion_only(
+                        adapter_feat,
+                        inference_steps=self.diffusion_inference_steps
+                    )
+
+                # Step 3: Final normalization (ensure both on unit sphere)
+                adapter_feat = F.normalize(adapter_feat, dim=-1)
+                adapt_hoitxt_features = F.normalize(adapt_hoitxt_features, dim=-1)
             else:
+                # No diffusion bridge: keep raw text embeddings
+                # Text adapter is NOT used (would corrupt distribution alignment)
                 adapt_hoitxt_features = hoitxt_features
+            # ========================================================== ↑
             
             
             if len(self.act_descriptor_feat_select) == 2 and len(self.act_descriptor_feat_select[0]) > 0:
