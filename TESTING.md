@@ -4,6 +4,34 @@ Quick guide to test the diffusion bridge modules without GPU or full dataset.
 
 ---
 
+## Setup (Required)
+
+### On Colab
+
+```python
+# Clone the test branch
+!git clone -b test https://github.com/NguyenTienHung2109/EZ-HOI.git
+%cd EZ-HOI
+
+# Initialize the diffusion-bridge submodule (REQUIRED for full tests)
+!git submodule update --init --recursive
+```
+
+### On Local Machine
+
+```bash
+# Clone the test branch
+git clone -b test https://github.com/NguyenTienHung2109/EZ-HOI.git
+cd EZ-HOI
+
+# Initialize the diffusion-bridge submodule (REQUIRED for full tests)
+git submodule update --init --recursive
+```
+
+**Note:** The `diffusion-bridge` submodule is required to load and run the actual diffusion model. Without it, tests will skip the diffusion sampling part but still verify the geometric transformation logic.
+
+---
+
 ## Test Files Created
 
 | File | Purpose | Run Time |

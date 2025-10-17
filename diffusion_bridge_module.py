@@ -101,7 +101,9 @@ class DiffusionBridgeHOI(nn.Module):
         except ImportError as e:
             raise ImportError(
                 f"Could not import diffusion modules. "
-                f"Make sure diffusion-bridge is set up: {e}"
+                f"Make sure diffusion-bridge submodule is initialized.\n"
+                f"Run: git submodule update --init --recursive\n"
+                f"Error: {e}"
             )
 
         if not Path(diffusion_path).exists():
@@ -376,6 +378,19 @@ def test_diffusion_bridge():
             verbose=True
         )
         print("  ✓ Module loaded successfully\n")
+    except ImportError as e:
+        print(f"  ❌ Failed to load: {e}\n")
+        print("="*70)
+        print("⚠️  Diffusion-bridge submodule not initialized")
+        print("="*70)
+        print("\nTo initialize the submodule:")
+        print("  git submodule update --init --recursive")
+        print("\nOr on Colab, run these commands before testing:")
+        print("  %cd /content/EZ-HOI")
+        print("  !git submodule update --init --recursive")
+        print("\nSkipping diffusion tests, but geometric transform tests passed!")
+        print("="*70 + "\n")
+        return
     except Exception as e:
         print(f"  ❌ Failed to load: {e}")
         return
