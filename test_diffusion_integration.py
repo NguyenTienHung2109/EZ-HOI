@@ -17,6 +17,10 @@ Usage:
 import torch
 import torch.nn.functional as F
 import sys
+import os
+
+# Ensure local modules are imported first (avoid conflicts with system packages)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 print("\n" + "="*70)
 print("Diffusion Bridge Integration Test (CPU Mode)")

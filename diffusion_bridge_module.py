@@ -30,6 +30,9 @@ import sys
 import os
 from pathlib import Path
 
+# Ensure local modules are imported first (avoid conflicts with system packages)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 
 class DiffusionBridgeHOI(nn.Module):
     """

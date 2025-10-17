@@ -10,17 +10,18 @@ Australian Centre for Robotic Vision
 
 from builtins import Exception
 import os
+import sys
 import torch
 import torch.distributed as dist
 
+# Ensure local modules are imported first (avoid conflicts with system packages)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from torch import nn, Tensor
 from typing import Optional, List
 from torchvision.ops.boxes import batched_nms, box_iou
 
 from ops import binary_focal_loss_with_logits
-
-import sys
 from hico_list import hico_verb_object_list,hico_verbs,hico_verbs_sentence,hico_verbs_sentence_2
 from vcoco_list import vcoco_verbs_sentence
 sys.path.append('detr')
