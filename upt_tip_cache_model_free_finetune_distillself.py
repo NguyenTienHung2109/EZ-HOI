@@ -2324,3 +2324,107 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         diffusion_config = diffusion_config  # Pass diffusion config
     )
     return detector
+
+
+if __name__ == '__main__':
+    """
+    Test DiffusionGeometricTransform module (CPU-only, no GPU required).
+
+    Run with: python upt_tip_cache_model_free_finetune_distillself.py
+    """
+    import torch
+    import torch.nn.functional as F
+
+    print("\n" + "="*70)
+    print("Testing DiffusionGeometricTransform Module")
+    print("="*70 + "\n")
+
+    # Test parameters
+    batch_size = 8
+    embed_dim = 512
+
+    # Create dummy text mean (mimics actual text mean)
+    print("1. Creating dummy text mean...")
+    text_mean = torch.randn(embed_dim)
+    text_mean = F.normalize(text_mean, dim=-1) * 0.05  # Realistic small magnitude
+    print(f"   Text mean shape: {text_mean.shape}")
+    print(f"   Text mean norm: {text_mean.norm().item():.6f}")
+
+    # Create transform module
+    print("\n2. Creating DiffusionGeometricTransform...")
+    transform = DiffusionGeometricTransform(text_mean)
+    print(f"   ✓ Module created")
+
+    # Test with vision features
+    print("\n3. Testing with vision features...")
+    vision_features = torch.randn(batch_size, embed_dim)
+    vision_features = F.normalize(vision_features, dim=-1)  # Pre-normalized
+
+    print(f"   Input shape: {vision_features.shape}")
+    print(f"   Input norms: {vision_features.norm(dim=-1)}")
+
+    # Apply transformation
+    transformed_vision = transform(vision_features)
+
+    print(f"   Output shape: {transformed_vision.shape}")
+    print(f"   Output norms: {transformed_vision.norm(dim=-1)}")
+
+    # Verify transformation
+    assert transformed_vision.shape == vision_features.shape, "Shape mismatch!"
+    assert torch.allclose(transformed_vision.norm(dim=-1), torch.ones(batch_size), atol=1e-5), "Not normalized!"
+    print(f"   ✓ Vision transformation correct")
+
+    # Test with text features
+    print("\n4. Testing with text features...")
+    text_features = torch.randn(600, embed_dim)  # 600 HOI classes
+    text_features = F.normalize(text_features, dim=-1)
+
+    transformed_text = transform(text_features)
+
+    print(f"   Input shape: {text_features.shape}")
+    print(f"   Output shape: {transformed_text.shape}")
+    print(f"   Output norms (mean): {transformed_text.norm(dim=-1).mean().item():.6f}")
+
+    assert transformed_text.shape == text_features.shape, "Shape mismatch!"
+    assert torch.allclose(transformed_text.norm(dim=-1), torch.ones(600), atol=1e-5), "Not normalized!"
+    print(f"   ✓ Text transformation correct")
+
+    # Test manual transformation to verify logic
+    print("\n5. Verifying transformation logic...")
+    manual_transform = vision_features.clone()
+    manual_transform = F.normalize(manual_transform, dim=-1)  # Step 1
+    manual_transform = manual_transform - text_mean           # Step 2
+    manual_transform = F.normalize(manual_transform, dim=-1)  # Step 3
+
+    assert torch.allclose(transformed_vision, manual_transform, atol=1e-6), "Logic mismatch!"
+    print(f"   ✓ Transformation logic verified")
+
+    # Test that both vision and text are in same space
+    print("\n6. Testing coordinate space alignment...")
+    similarity_before = vision_features @ text_features.T
+    similarity_after = transformed_vision @ transformed_text.T
+
+    print(f"   Similarity before (mean): {similarity_before.mean().item():.4f}")
+    print(f"   Similarity after (mean): {similarity_after.mean().item():.4f}")
+    print(f"   Both are normalized and in same coordinate space")
+
+    # Test gradient flow
+    print("\n7. Testing gradient flow (differentiability)...")
+    vision_grad = torch.randn(batch_size, embed_dim, requires_grad=True)
+    vision_grad_norm = F.normalize(vision_grad, dim=-1)
+
+    output = transform(vision_grad_norm)
+    loss = output.sum()
+    loss.backward()
+
+    assert vision_grad.grad is not None, "No gradients!"
+    print(f"   ✓ Gradients flow correctly")
+    print(f"   Gradient norm: {vision_grad.grad.norm().item():.6f}")
+
+    # Summary
+    print("\n" + "="*70)
+    print("✅ ALL TESTS PASSED!")
+    print("="*70)
+    print("\nDiffusionGeometricTransform module is working correctly.")
+    print("You can now test the full diffusion bridge integration.")
+    print("="*70 + "\n")

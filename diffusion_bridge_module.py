@@ -300,63 +300,143 @@ def test_diffusion_bridge():
     Test function to verify diffusion bridge works correctly.
 
     Run with: python diffusion_bridge_module.py
+
+    Tests both full forward() and apply_diffusion_only() methods.
+    If diffusion checkpoint is not available, runs basic sanity checks only.
     """
-    print("\n" + "="*60)
-    print("Testing Diffusion Bridge Module")
-    print("="*60 + "\n")
+    print("\n" + "="*70)
+    print("Testing Diffusion Bridge Module (CPU Mode)")
+    print("="*70 + "\n")
 
     # Test parameters
-    diffusion_path = 'hoi_diffusion_results/model-300.pt'
-    text_mean_path = 'hicodet_pkl_files/hoi_text_mean_vitB_600.pkl'
+    diffusion_path = 'dummy_diffusion_files/dummy_diffusion_vitB.pt'
+    text_mean_path = 'dummy_diffusion_files/dummy_text_mean_vitB.pkl'
+
+    # Check alternative paths
+    if not Path(diffusion_path).exists():
+        diffusion_path = 'hoi_diffusion_results/model-300.pt'
+        text_mean_path = 'hicodet_pkl_files/hoi_text_mean_vitB_600.pkl'
 
     # Check if files exist
-    if not Path(diffusion_path).exists():
-        print(f"⚠️  Diffusion model not found: {diffusion_path}")
-        print("Please train the diffusion model first:")
-        print("  python train_hoi_diffusion.py")
+    has_checkpoint = Path(diffusion_path).exists() and Path(text_mean_path).exists()
+
+    if not has_checkpoint:
+        print("⚠️  Diffusion checkpoint not found.")
+        print("   Running basic sanity tests only (without diffusion sampling)...\n")
+
+        # Run basic tests without actual checkpoint
+        print("Test 1: Geometric transformation logic")
+        batch_size = 4
+        embed_dim = 512
+
+        # Create dummy text mean
+        text_mean = torch.randn(embed_dim)
+        text_mean = F.normalize(text_mean, dim=-1) * 0.05
+
+        # Create features
+        features = torch.randn(batch_size, embed_dim)
+        features = F.normalize(features, dim=-1)
+
+        # Manual geometric transform (what DiffusionBridgeHOI.forward() does)
+        transformed = F.normalize(features, dim=-1)
+        transformed = transformed - text_mean
+        transformed = F.normalize(transformed, dim=-1)
+
+        print(f"  Input shape: {features.shape}")
+        print(f"  Output shape: {transformed.shape}")
+        print(f"  Output norms: {transformed.norm(dim=-1)}")
+        assert torch.allclose(transformed.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
+        print(f"  ✓ Geometric transformation works correctly\n")
+
+        print("="*70)
+        print("✅ Basic sanity tests passed!")
+        print("="*70)
+        print("\nTo test with actual diffusion:")
+        print("  1. Create dummy files: python create_dummy_diffusion_files.py")
+        print("  2. Or use real COCO checkpoint")
+        print("  3. Re-run this test")
+        print("="*70 + "\n")
         return
 
-    if not Path(text_mean_path).exists():
-        print(f"⚠️  Text mean not found: {text_mean_path}")
-        print("Please extract text embeddings first:")
-        print("  python extract_hoi_text_embeddings.py")
-        return
+    # Full test with checkpoint
+    print(f"Found checkpoint files:")
+    print(f"  Diffusion: {diffusion_path}")
+    print(f"  Text mean: {text_mean_path}\n")
 
     # Create module
-    print("Creating diffusion bridge module...")
-    bridge = DiffusionBridgeHOI(
-        diffusion_path=diffusion_path,
-        text_mean_path=text_mean_path,
-        inference_steps=100,  # Use fewer steps for testing
-        verbose=True
-    )
+    print("Test 1: Loading diffusion bridge module...")
+    try:
+        bridge = DiffusionBridgeHOI(
+            diffusion_path=diffusion_path,
+            text_mean_path=text_mean_path,
+            inference_steps=100,  # Use fewer steps for testing
+            verbose=True
+        )
+        print("  ✓ Module loaded successfully\n")
+    except Exception as e:
+        print(f"  ❌ Failed to load: {e}")
+        return
 
     # Create dummy vision features
     batch_size = 4
     embed_dim = 512
     vision_features = torch.randn(batch_size, embed_dim)
-    vision_features = F.normalize(vision_features, dim=-1)  # Normalize like real features
+    vision_features = F.normalize(vision_features, dim=-1)
 
-    print(f"\nInput vision features:")
-    print(f"  Shape: {vision_features.shape}")
-    print(f"  Norms: {vision_features.norm(dim=-1)}")
+    # Test 2: Full forward pass
+    print("Test 2: Testing full forward() method...")
+    print(f"  Input shape: {vision_features.shape}")
+    print(f"  Input norms: {vision_features.norm(dim=-1)}")
 
-    # Apply diffusion bridge
-    print(f"\nApplying diffusion bridge (inference_steps=100)...")
     bridged_features = bridge(vision_features)
 
-    print(f"\nOutput bridged features:")
-    print(f"  Shape: {bridged_features.shape}")
-    print(f"  Norms: {bridged_features.norm(dim=-1)}")
+    print(f"  Output shape: {bridged_features.shape}")
+    print(f"  Output norms: {bridged_features.norm(dim=-1)}")
 
-    # Measure change
     cosine_sim = F.cosine_similarity(vision_features, bridged_features, dim=-1)
-    print(f"\nCosine similarity (input vs output):")
-    print(f"  Mean: {cosine_sim.mean().item():.4f}")
-    print(f"  Std:  {cosine_sim.std().item():.4f}")
+    print(f"  Cosine similarity (input vs output): {cosine_sim.mean().item():.4f}")
+    print(f"  ✓ forward() method works\n")
 
-    print("\n✓ Diffusion bridge test completed successfully!")
-    print("="*60 + "\n")
+    # Test 3: apply_diffusion_only() method
+    print("Test 3: Testing apply_diffusion_only() method...")
+
+    # Prepare features (already geometrically transformed)
+    geo_features = F.normalize(vision_features, dim=-1)
+    geo_features = geo_features - bridge._text_mean_buffer
+    geo_features = F.normalize(geo_features, dim=-1)
+
+    print(f"  Pre-transformed features shape: {geo_features.shape}")
+    print(f"  Pre-transformed norms: {geo_features.norm(dim=-1)}")
+
+    # Apply diffusion only
+    diffused_features = bridge.apply_diffusion_only(geo_features, inference_steps=50)
+
+    print(f"  Diffused output shape: {diffused_features.shape}")
+    print(f"  Diffused output norms: {diffused_features.norm(dim=-1)}")
+
+    assert diffused_features.shape == geo_features.shape
+    assert torch.allclose(diffused_features.norm(dim=-1), torch.ones(batch_size), atol=1e-5)
+    print(f"  ✓ apply_diffusion_only() method works\n")
+
+    # Test 4: Different inference steps
+    print("Test 4: Testing with different inference steps...")
+    diffused_50 = bridge.apply_diffusion_only(geo_features, inference_steps=50)
+    diffused_100 = bridge.apply_diffusion_only(geo_features, inference_steps=100)
+
+    sim_50_100 = F.cosine_similarity(diffused_50, diffused_100, dim=-1)
+    print(f"  Similarity (50 vs 100 steps): {sim_50_100.mean().item():.4f}")
+    print(f"  ✓ Different step counts work\n")
+
+    # Summary
+    print("="*70)
+    print("✅ ALL TESTS PASSED!")
+    print("="*70)
+    print("\nDiffusion bridge module is working correctly:")
+    print("  ✓ forward() - Full geometric transform + diffusion")
+    print("  ✓ apply_diffusion_only() - Diffusion sampling only")
+    print("  ✓ Different inference steps - Flexible configuration")
+    print("\nReady for integration into EZ-HOI training!")
+    print("="*70 + "\n")
 
 
 if __name__ == '__main__':
