@@ -1,0 +1,3 @@
+[submodule "diffusion-bridge"]
+	path = diffusion-bridge
+	url = https://github.com/NguyenTienHung2109/diffusion-bridge.git
