@@ -686,9 +686,9 @@ class MultiModalPromptLearner(nn.Module):
         if self.img_clip_pt is True:
             for index, vis_pt_i in enumerate(visual_deep_prompts):
                 visual_deep_prompts[index] = self.img_clip_pt_adapter(vis_pt_i.to(self.ctx.device).unsqueeze(1).repeat(1,len(img_clip_prior),1),
-                                (img_clip_prior.to(self.ctx.device), None))
+                                (img_clip_prior.to(device=self.ctx.device, dtype=self.ctx.dtype), None))
             first_ly_vis_pt = self.img_clip_pt_adapter(first_ly_vis_pt.to(self.ctx.device).unsqueeze(1).repeat(1,len(img_clip_prior),1),
-                                (img_clip_prior.to(self.ctx.device), None))
+                                (img_clip_prior.to(device=self.ctx.device, dtype=self.ctx.dtype), None))
         
         origin_ctx = None
         if self.txtcls_pt is True:

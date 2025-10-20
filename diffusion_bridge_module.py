@@ -125,10 +125,10 @@ class DiffusionBridgeHOI(nn.Module):
             state_dict = checkpoint
 
         # Infer embedding dimension from state dict
-        # The model's first layer should give us the embedding dimension
+        # Look for time_mlp layer which has shape [hidden_dim, embed_dim]
         for key in state_dict.keys():
-            if 'init_conv' in key and 'weight' in key:
-                embed_dim = state_dict[key].shape[2]  # seq_length dimension
+            if 'time_mlp.1.weight' in key:
+                embed_dim = state_dict[key].shape[1]  # embedding dimension
                 break
         else:
             # Fallback: assume 512 (ViT-B/16)
