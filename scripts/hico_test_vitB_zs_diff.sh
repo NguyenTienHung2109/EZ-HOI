@@ -22,4 +22,5 @@ CUDA_VISIBLE_DEVICES=0 python main_tip_finetune.py --world-size 1 \
  --diffusion_model_path diffusion-bridge/ddpm/results/model_59.pt \
  --diffusion_text_mean diffusion-bridge/ddpm/data/coco/normalized_text_embed_mean.pkl \
  --diffusion_inference_steps 600 \
+ --diffusion_embed_dim 512 \
  --eval --resume <path to the model file>

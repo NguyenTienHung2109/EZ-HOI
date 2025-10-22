@@ -729,6 +729,8 @@ if __name__ == '__main__':
                         help='Path to HOI text mean for normalization')
     parser.add_argument('--diffusion_inference_steps', type=int, default=600,
                         help='Number of DDIM sampling steps (100-1000, trade-off speed/quality)')
+    parser.add_argument('--diffusion_embed_dim', type=int, default=512,
+                        help='Embedding dimension for diffusion model (512 for ViT-B/16, 768 for ViT-L/14)')
 
 
 

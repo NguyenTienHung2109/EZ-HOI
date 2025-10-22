@@ -46,19 +46,22 @@ class DiffusionBridgeHOI(nn.Module):
     """
 
     def __init__(self, diffusion_path, text_mean_path, inference_steps=600,
-                 scale_factor=5.0, verbose=False):
+                 scale_factor=5.0, embed_dim=None, verbose=False):
         """
         Args:
             diffusion_path: Path to trained diffusion model (.pt file)
             text_mean_path: Path to HOI text mean (.pkl file)
             inference_steps: Number of DDIM steps (100-1000, trade-off speed/quality)
             scale_factor: Scale factor for normalization chain (default: 5.0)
+            embed_dim: Embedding dimension (512 for ViT-B/16, 768 for ViT-L/14).
+                       If None, will attempt auto-detection from checkpoint.
             verbose: Print detailed information during initialization
         """
         super().__init__()
 
         self.inference_steps = inference_steps
         self.scale_factor = scale_factor
+        self.embed_dim = embed_dim
         self.verbose = verbose
 
         if verbose:
@@ -69,6 +72,10 @@ class DiffusionBridgeHOI(nn.Module):
             print(f"Text mean: {text_mean_path}")
             print(f"Inference steps: {inference_steps}")
             print(f"Scale factor: {scale_factor}")
+            if embed_dim is not None:
+                print(f"Embedding dimension: {embed_dim} (manually specified)")
+            else:
+                print(f"Embedding dimension: auto-detect from checkpoint")
 
         # Load trained diffusion model
         self.diffusion = self._load_diffusion_model(diffusion_path)
@@ -124,20 +131,43 @@ class DiffusionBridgeHOI(nn.Module):
         else:
             state_dict = checkpoint
 
-        # Infer embedding dimension from state dict
-        # Look for time_mlp layer which has shape [hidden_dim, embed_dim]
-        for key in state_dict.keys():
-            if 'time_mlp.1.weight' in key:
-                embed_dim = state_dict[key].shape[1]  # embedding dimension
-                break
-        else:
-            # Fallback: assume 512 (ViT-B/16)
-            embed_dim = 512
+        # Determine embedding dimension
+        if self.embed_dim is not None:
+            # Use manually specified dimension
+            embed_dim = self.embed_dim
             if self.verbose:
-                print(f"  Warning: Could not infer embedding dim, assuming {embed_dim}")
+                print(f"  Using specified embedding dimension: {embed_dim}")
+        else:
+            # Auto-detect from checkpoint
+            embed_dim = None
+
+            # Method 1: Try model.init_conv.weight shape [init_dim, channels, embed_dim]
+            if 'model.init_conv.weight' in state_dict:
+                init_conv_shape = state_dict['model.init_conv.weight'].shape
+                if len(init_conv_shape) == 3:
+                    embed_dim = init_conv_shape[2]
+                    if self.verbose:
+                        print(f"  Auto-detected embed_dim from init_conv: {embed_dim}")
+
+            # Method 2: Try model.final_conv.2.weight shape [channels, hidden_dim, embed_dim]
+            if embed_dim is None and 'model.final_conv.2.weight' in state_dict:
+                final_conv_shape = state_dict['model.final_conv.2.weight'].shape
+                if len(final_conv_shape) == 3:
+                    embed_dim = final_conv_shape[2]
+                    if self.verbose:
+                        print(f"  Auto-detected embed_dim from final_conv: {embed_dim}")
+
+            # Method 3: Fallback to 512 (ViT-B/16)
+            if embed_dim is None:
+                embed_dim = 512
+                if self.verbose:
+                    print(f"  ⚠️  Warning: Could not auto-detect embedding dim")
+                    print(f"  Available keys: {list(state_dict.keys())[:5]}...")
+                    print(f"  Falling back to default: {embed_dim}")
+                    print(f"  Tip: Specify embed_dim explicitly in config to avoid this warning")
 
         if self.verbose:
-            print(f"  Embedding dimension: {embed_dim}")
+            print(f"  ✓ Embedding dimension: {embed_dim}")
 
         # Reconstruct model architecture (must match training)
         model = Unet1D(

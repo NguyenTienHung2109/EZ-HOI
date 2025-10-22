@@ -914,6 +914,7 @@ class UPT(nn.Module):
                     text_mean_path=diffusion_config['text_mean_path'],
                     inference_steps=diffusion_config.get('inference_steps', 600),
                     scale_factor=diffusion_config.get('scale_factor', 5.0),
+                    embed_dim=diffusion_config.get('embed_dim', None),
                     verbose=True
                 )
 
@@ -2299,7 +2300,8 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
             'model_path': args.diffusion_model_path,
             'text_mean_path': args.diffusion_text_mean,
             'inference_steps': args.diffusion_inference_steps,
-            'scale_factor': 5.0  # Standard diffusion-bridge scale
+            'scale_factor': 5.0,  # Standard diffusion-bridge scale
+            'embed_dim': args.diffusion_embed_dim  # Embedding dimension (512 or 768)
         }
 
     detector = UPT(args,
