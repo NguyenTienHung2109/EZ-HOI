@@ -1,13 +1,22 @@
 #!/bin/bash
-# HICO-DET training with ViT-L/14@336px + Diffusion Bridge (Zero-shot unseen verb setting)
+# HICO-DET training with ViT-L/14@336px + Pre-Bridged Embeddings (Zero-shot unseen verb setting)
 #
-# This script trains EZ-HOI with diffusion bridge for vision-text alignment.
+# This script trains EZ-HOI with pre-computed diffusion-bridged vision embeddings.
+#
+# PREREQUISITES:
+# 1. Run precompute_bridged_vision_embeddings.py FIRST to generate bridged embeddings:
+#    python precompute_bridged_vision_embeddings.py \
+#        --input_dir hicodet_pkl_files/clip336_img_hicodet_train \
+#        --output_dir hicodet_pkl_files/clip336_img_hicodet_train_bridged \
+#        --diffusion_model hoi_diffusion_results/model-vitL-300.pt \
+#        --text_mean hicodet_pkl_files/hoi_text_mean_vitL_600.pkl \
+#        --embed_dim 768 \
+#        --inference_steps 600
 #
 # IMPORTANT:
-# - Do NOT use --txt_align flag (text adapter corrupts CLIP distribution)
-# - Training will be 2-3x slower due to diffusion sampling (600 steps per batch)
-# - Ensure diffusion model (model_59.pt) and text mean (normalized_text_embed_mean.pkl) exist
-# - Your COCO diffusion should have been trained with matching CLIP architecture
+# - Vision embeddings are now pre-bridged (no runtime overhead!)
+# - Do NOT use --txt_align flag (text embeddings stay as raw CLIP)
+# - Training will be much faster compared to runtime diffusion bridging
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_tip_finetune.py --world-size 4 \
  --pretrained "checkpoints/detr-r50-hicodet.pth" \
@@ -17,11 +26,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main_tip_finetune.py --world-size 4 \
  --clip_dir_vit checkpoints/pretrained_CLIP/ViT-L-14-336px.pt \
  --batch-size 4  --logits_type "HO"  --port 1231 \
  --txtcls_pt   --img_align  --unseen_pt_inj  --img_clip_pt \
- --clip_img_file hicodet_pkl_files/clip336_img_hicodet_train \
- --zs --zs_type "unseen_verb" \
- --use_diffusion_bridge \
- --diffusion_model_path diffusion-bridge/ddpm/results/model_59.pt \
- --diffusion_text_mean diffusion-bridge/ddpm/data/coco/normalized_text_embed_mean.pkl \
- --diffusion_inference_steps 600 \
- --diffusion_embed_dim 768
+ --clip_img_file hicodet_pkl_files/clip336_img_hicodet_train_bridged \
+ --zs --zs_type "unseen_verb"
 

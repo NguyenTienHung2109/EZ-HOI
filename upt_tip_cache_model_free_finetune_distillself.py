@@ -272,46 +272,6 @@ class Weight_Pred(nn.Module):
         x = self.linear2(x)
         return F.sigmoid(x)
 
-class DiffusionGeometricTransform(nn.Module):
-    """
-    Applies the geometric transformation used by diffusion bridge.
-    This is differentiable and puts features into the coordinate space
-    where the diffusion model operates.
-
-    Transformation pipeline:
-    1. L2 normalize to unit sphere
-    2. Subtract HOI text mean (shifts distribution center)
-    3. L2 normalize again (project back to unit sphere)
-
-    This creates a new coordinate system on the unit sphere where
-    diffusion-refined vision features and text features can be meaningfully compared.
-
-    NOTE: This is applied to BOTH vision and text features for alignment,
-    but only vision features go through subsequent diffusion sampling.
-    """
-    def __init__(self, text_mean):
-        super().__init__()
-        # Register text_mean as buffer (moves with model to GPU, but not trained)
-        self.register_buffer('text_mean', text_mean)
-
-    def forward(self, features):
-        """
-        Args:
-            features: [N, D] embeddings (either vision or text)
-        Returns:
-            transformed_features: [N, D] embeddings in diffusion coordinate space
-        """
-        # Step 1: L2 normalize to unit sphere
-        features = F.normalize(features, dim=-1)
-
-        # Step 2: Subtract text mean (key geometric shift!)
-        features = features - self.text_mean
-
-        # Step 3: Renormalize to unit sphere (new coordinate system)
-        features = F.normalize(features, dim=-1)
-
-        return features
-
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -900,49 +860,6 @@ class UPT(nn.Module):
             self.filtered_hoi_idx = []
             self.zs_type = None
 
-        # Diffusion bridge for modality alignment (optional, inference-only)
-        self.use_diffusion_bridge = args.use_diffusion_bridge if hasattr(args, 'use_diffusion_bridge') else False
-        if self.use_diffusion_bridge:
-            from diffusion_bridge_module import DiffusionBridgeHOI
-            diffusion_config = kwargs.get('diffusion_config', None)
-            if diffusion_config is not None:
-                print(f"\n{'='*60}")
-                print("Initializing Diffusion Bridge for HOI Detection")
-                print(f"{'='*60}")
-                self.diffusion_bridge = DiffusionBridgeHOI(
-                    diffusion_path=diffusion_config['model_path'],
-                    text_mean_path=diffusion_config['text_mean_path'],
-                    inference_steps=diffusion_config.get('inference_steps', 600),
-                    scale_factor=diffusion_config.get('scale_factor', 5.0),
-                    embed_dim=diffusion_config.get('embed_dim', None),
-                    verbose=True
-                )
-
-                # Initialize geometric transform module (shared for vision and text)
-                # Extract text_mean from diffusion bridge for coordinate alignment
-                text_mean = self.diffusion_bridge._text_mean_buffer
-                self.diffusion_geometric_transform = DiffusionGeometricTransform(text_mean)
-
-                # Store training/inference step configuration
-                self.diffusion_training_steps = diffusion_config.get('training_steps', 100)
-                self.diffusion_inference_steps = diffusion_config.get('inference_steps', 600)
-
-                print(f"✓ Diffusion bridge initialized and ready")
-                print(f"  Mode: Training + Inference (frozen diffusion weights)")
-                print(f"  Training steps: {self.diffusion_training_steps}")
-                print(f"  Inference steps: {self.diffusion_inference_steps}")
-                print(f"  Geometric transform: Shared for vision and text")
-                print(f"  Integration point: After adapters, before classification")
-                print(f"{'='*60}\n")
-            else:
-                print("Warning: use_diffusion_bridge=True but no diffusion_config provided")
-                print("Diffusion bridge will not be used.")
-                self.diffusion_bridge = None
-                self.diffusion_geometric_transform = None
-        else:
-            self.diffusion_bridge = None
-            self.diffusion_geometric_transform = None
-
         # self.unseen_verb_idxs = []
         self.label_choice = args.label_choice
         self.img_align = args.img_align
@@ -950,12 +867,6 @@ class UPT(nn.Module):
         if args.img_align is True:
             self.mem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
 
-        # Text adapter REMOVED when using diffusion bridge
-        # Reason: Diffusion bridge converts vision features to raw CLIP text distribution.
-        # Text adapter would transform text away from this target distribution, causing misalignment.
-        # When using diffusion bridge, text embeddings should remain as raw CLIP outputs.
-        # if args.txt_align is True:
-        #     self.txtmem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
         self.select_HOI_index = kwargs['select_HOI_index']
         self.one_hots_HO, self.sample_lens_HO = self.load_cache_model(file1=file1, feature='hum_obj',num_classes=self.num_classes, num_shot=num_shot, filtered_hoi_idx = self.filtered_hoi_idx, 
                                                                                             use_multi_hot=self.use_multi_hot, label_choice=self.label_choice, num_anno=self.num_anno,
@@ -1337,37 +1248,9 @@ class UPT(nn.Module):
                 self._extracted_visual_feat = adapter_feat.detach().cpu()
             # ========================================================== ↑
 
-            # ========== DIFFUSION BRIDGE INTEGRATION ========== ↓
-            # Apply diffusion-based modality alignment (vision→text)
-            if self.diffusion_geometric_transform is not None:
-                # Step 1: Apply geometric transform to BOTH vision and text
-                # This puts both modalities in the same coordinate space where diffusion operates
-                adapter_feat = self.diffusion_geometric_transform(adapter_feat)
-                adapt_hoitxt_features = self.diffusion_geometric_transform(hoitxt_features)
-
-                # Step 2: Apply diffusion sampling ONLY to vision features
-                # Text features are already in target distribution, no diffusion needed
-                if self.training:
-                    # Training: use fewer steps for speed
-                    adapter_feat = self.diffusion_bridge.apply_diffusion_only(
-                        adapter_feat,
-                        inference_steps=self.diffusion_training_steps
-                    )
-                else:
-                    # Inference: use full steps for quality
-                    adapter_feat = self.diffusion_bridge.apply_diffusion_only(
-                        adapter_feat,
-                        inference_steps=self.diffusion_inference_steps
-                    )
-
-                # Step 3: Final normalization (ensure both on unit sphere)
-                adapter_feat = F.normalize(adapter_feat, dim=-1)
-                adapt_hoitxt_features = F.normalize(adapt_hoitxt_features, dim=-1)
-            else:
-                # No diffusion bridge: keep raw text embeddings
-                # Text adapter is NOT used (would corrupt distribution alignment)
-                adapt_hoitxt_features = hoitxt_features
-            # ========================================================== ↑
+            # Vision features are pre-bridged (loaded from pkl), use directly
+            # Text features remain as raw CLIP embeddings
+            adapt_hoitxt_features = hoitxt_features
             
             
             if len(self.act_descriptor_feat_select) == 2 and len(self.act_descriptor_feat_select[0]) > 0:
@@ -2293,17 +2176,6 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
 
     model = CustomCLIP(args, classnames=selected_classnames, clip_model=clip_model, object_class_to_target_class=class_corr)
 
-    # Prepare diffusion bridge config if enabled
-    diffusion_config = None
-    if args.use_diffusion_bridge:
-        diffusion_config = {
-            'model_path': args.diffusion_model_path,
-            'text_mean_path': args.diffusion_text_mean,
-            'inference_steps': args.diffusion_inference_steps,
-            'scale_factor': 5.0,  # Standard diffusion-bridge scale
-            'embed_dim': args.diffusion_embed_dim  # Embedding dimension (512 or 768)
-        }
-
     detector = UPT(args,
         detr, postprocessors['bbox'], model, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,
@@ -2323,111 +2195,19 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         select_HOI_index = select_HOI_index,
         fixed_clip_enctxt = fixed_clip_model.encode_text,
         unseen_text_priors = unseen_text_priors,
-        act_descriptor_feat_select = act_descriptor_feat_select,
-        diffusion_config = diffusion_config  # Pass diffusion config
+        act_descriptor_feat_select = act_descriptor_feat_select
     )
     return detector
 
 
 if __name__ == '__main__':
     """
-    Test DiffusionGeometricTransform module (CPU-only, no GPU required).
+    Main model file for EZ-HOI with UPT detector.
 
-    Run with: python upt_tip_cache_model_free_finetune_distillself.py
+    For testing, run the pre-computation script:
+        python precompute_bridged_vision_embeddings.py
     """
-    import torch
-    import torch.nn.functional as F
-
-    print("\n" + "="*70)
-    print("Testing DiffusionGeometricTransform Module")
-    print("="*70 + "\n")
-
-    # Test parameters
-    batch_size = 8
-    embed_dim = 512
-
-    # Create dummy text mean (mimics actual text mean)
-    print("1. Creating dummy text mean...")
-    text_mean = torch.randn(embed_dim)
-    text_mean = F.normalize(text_mean, dim=-1) * 0.05  # Realistic small magnitude
-    print(f"   Text mean shape: {text_mean.shape}")
-    print(f"   Text mean norm: {text_mean.norm().item():.6f}")
-
-    # Create transform module
-    print("\n2. Creating DiffusionGeometricTransform...")
-    transform = DiffusionGeometricTransform(text_mean)
-    print(f"   ✓ Module created")
-
-    # Test with vision features
-    print("\n3. Testing with vision features...")
-    vision_features = torch.randn(batch_size, embed_dim)
-    vision_features = F.normalize(vision_features, dim=-1)  # Pre-normalized
-
-    print(f"   Input shape: {vision_features.shape}")
-    print(f"   Input norms: {vision_features.norm(dim=-1)}")
-
-    # Apply transformation
-    transformed_vision = transform(vision_features)
-
-    print(f"   Output shape: {transformed_vision.shape}")
-    print(f"   Output norms: {transformed_vision.norm(dim=-1)}")
-
-    # Verify transformation
-    assert transformed_vision.shape == vision_features.shape, "Shape mismatch!"
-    assert torch.allclose(transformed_vision.norm(dim=-1), torch.ones(batch_size), atol=1e-5), "Not normalized!"
-    print(f"   ✓ Vision transformation correct")
-
-    # Test with text features
-    print("\n4. Testing with text features...")
-    text_features = torch.randn(600, embed_dim)  # 600 HOI classes
-    text_features = F.normalize(text_features, dim=-1)
-
-    transformed_text = transform(text_features)
-
-    print(f"   Input shape: {text_features.shape}")
-    print(f"   Output shape: {transformed_text.shape}")
-    print(f"   Output norms (mean): {transformed_text.norm(dim=-1).mean().item():.6f}")
-
-    assert transformed_text.shape == text_features.shape, "Shape mismatch!"
-    assert torch.allclose(transformed_text.norm(dim=-1), torch.ones(600), atol=1e-5), "Not normalized!"
-    print(f"   ✓ Text transformation correct")
-
-    # Test manual transformation to verify logic
-    print("\n5. Verifying transformation logic...")
-    manual_transform = vision_features.clone()
-    manual_transform = F.normalize(manual_transform, dim=-1)  # Step 1
-    manual_transform = manual_transform - text_mean           # Step 2
-    manual_transform = F.normalize(manual_transform, dim=-1)  # Step 3
-
-    assert torch.allclose(transformed_vision, manual_transform, atol=1e-6), "Logic mismatch!"
-    print(f"   ✓ Transformation logic verified")
-
-    # Test that both vision and text are in same space
-    print("\n6. Testing coordinate space alignment...")
-    similarity_before = vision_features @ text_features.T
-    similarity_after = transformed_vision @ transformed_text.T
-
-    print(f"   Similarity before (mean): {similarity_before.mean().item():.4f}")
-    print(f"   Similarity after (mean): {similarity_after.mean().item():.4f}")
-    print(f"   Both are normalized and in same coordinate space")
-
-    # Test gradient flow
-    print("\n7. Testing gradient flow (differentiability)...")
-    vision_grad = torch.randn(batch_size, embed_dim, requires_grad=True)
-    vision_grad_norm = F.normalize(vision_grad, dim=-1)
-
-    output = transform(vision_grad_norm)
-    loss = output.sum()
-    loss.backward()
-
-    assert vision_grad.grad is not None, "No gradients!"
-    print(f"   ✓ Gradients flow correctly")
-    print(f"   Gradient norm: {vision_grad.grad.norm().item():.6f}")
-
-    # Summary
-    print("\n" + "="*70)
-    print("✅ ALL TESTS PASSED!")
-    print("="*70)
-    print("\nDiffusionGeometricTransform module is working correctly.")
+    print("EZ-HOI UPT Model")
+    print("Use precompute_bridged_vision_embeddings.py to pre-compute bridged embeddings")
     print("You can now test the full diffusion bridge integration.")
     print("="*70 + "\n")
