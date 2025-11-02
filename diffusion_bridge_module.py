@@ -4,17 +4,22 @@ Diffusion Bridge Module for HOI Detection
 This module applies a trained diffusion model to bridge the modality gap between
 vision features (union crops) and text features (HOI descriptions).
 
+Following the original diffusion-bridge paper implementation:
+- Uses VISION embedding mean (not text mean) for normalization
+- Uses 5 DDIM steps (not 600) for fast inference
+- inference_steps parameter controls timestep range (600→0), not iteration count
+
 Process:
 1. Normalize vision features
-2. Apply diffusion-bridge normalization chain (subtract mean, renormalize, scale)
-3. Run DDIM sampling to refine features toward text distribution
+2. Apply diffusion-bridge normalization chain (subtract VISION mean, renormalize, scale)
+3. Run DDIM sampling (~5 iterations) to refine features toward text distribution
 4. Reverse normalization to standard CLIP space
 
 Usage:
     bridge = DiffusionBridgeHOI(
         diffusion_path='hoi_diffusion_results/model-300.pt',
-        text_mean_path='hicodet_pkl_files/hoi_text_mean_vitB_600.pkl',
-        inference_steps=600
+        vision_mean_path='hicodet_pkl_files/hoi_vision_mean_vitB.pkl',  # VISION mean!
+        inference_steps=600  # Timestep range, NOT iteration count
     )
 
     # At inference time
@@ -45,13 +50,18 @@ class DiffusionBridgeHOI(nn.Module):
     - Returns features in standard CLIP space for classification
     """
 
-    def __init__(self, diffusion_path, text_mean_path, inference_steps=600,
+    def __init__(self, diffusion_path, vision_mean_path, inference_steps=600,
                  scale_factor=5.0, embed_dim=None, verbose=False):
         """
         Args:
             diffusion_path: Path to trained diffusion model (.pt file)
-            text_mean_path: Path to HOI text mean (.pkl file)
-            inference_steps: Number of DDIM steps (100-1000, trade-off speed/quality)
+            vision_mean_path: Path to HOI vision mean (.pkl file)
+                             This should be the VISION embedding mean (not text mean)
+                             to match the original diffusion-bridge implementation
+            inference_steps: DDIM inference timestep range (e.g., 600 means steps 600→0)
+                            Note: This is NOT the number of denoising iterations
+                            The actual number of iterations is controlled by sampling_timesteps
+                            in the model initialization (set to 5 for fast inference)
             scale_factor: Scale factor for normalization chain (default: 5.0)
             embed_dim: Embedding dimension (512 for ViT-B/16, 768 for ViT-L/14).
                        If None, will attempt auto-detection from checkpoint.
@@ -69,8 +79,8 @@ class DiffusionBridgeHOI(nn.Module):
             print("Initializing Diffusion Bridge Module")
             print("="*60)
             print(f"Diffusion model: {diffusion_path}")
-            print(f"Text mean: {text_mean_path}")
-            print(f"Inference steps: {inference_steps}")
+            print(f"Vision mean: {vision_mean_path}")
+            print(f"Inference timestep range: {inference_steps}")
             print(f"Scale factor: {scale_factor}")
             if embed_dim is not None:
                 print(f"Embedding dimension: {embed_dim} (manually specified)")
@@ -80,8 +90,8 @@ class DiffusionBridgeHOI(nn.Module):
         # Load trained diffusion model
         self.diffusion = self._load_diffusion_model(diffusion_path)
 
-        # Load HOI text mean
-        self.hoi_text_mean = self._load_text_mean(text_mean_path)
+        # Load HOI vision mean (following original diffusion-bridge implementation)
+        self.hoi_vision_mean = self._load_vision_mean(vision_mean_path)
 
         # Freeze all parameters (inference only, no gradients)
         self.diffusion.eval()
@@ -90,8 +100,8 @@ class DiffusionBridgeHOI(nn.Module):
 
         if verbose:
             print(f"✓ Diffusion bridge initialized")
-            print(f"  Text mean shape: {self.hoi_text_mean.shape}")
-            print(f"  Text mean norm: {self.hoi_text_mean.norm().item():.6f}")
+            print(f"  Vision mean shape: {self.hoi_vision_mean.shape}")
+            print(f"  Vision mean norm: {self.hoi_vision_mean.norm().item():.6f}")
             print("="*60)
 
     def _load_diffusion_model(self, diffusion_path):
@@ -177,12 +187,16 @@ class DiffusionBridgeHOI(nn.Module):
             channels=1
         )
 
+        # CRITICAL: sampling_timesteps controls the NUMBER of denoising iterations
+        # Original diffusion-bridge uses sampling_timesteps=5 (NOT inference_steps!)
+        # This means only ~5 DDIM steps regardless of inference_step parameter
+        # inference_step (passed to ddim_sample_with_img) controls the timestep RANGE
         diffusion = GaussianDiffusion1D_norm(
             model,
             seq_length=embed_dim,
             timesteps=1000,
             objective='pred_x0',
-            sampling_timesteps=self.inference_steps  # Use DDIM with fewer steps
+            sampling_timesteps=5  # Fixed to 5 DDIM steps for fast inference
         )
 
         # Load weights
@@ -191,64 +205,81 @@ class DiffusionBridgeHOI(nn.Module):
         if self.verbose:
             num_params = sum(p.numel() for p in diffusion.parameters())
             print(f"  ✓ Loaded diffusion model ({num_params:,} parameters)")
+            print(f"  DDIM configuration:")
+            print(f"    - Total timesteps: 1000")
+            print(f"    - Sampling timesteps: 5 (number of denoising iterations)")
+            print(f"    - Inference step range: {self.inference_steps} → 0")
+            print(f"    - Effective speed: ~120x faster than dense sampling")
 
         return diffusion
 
-    def _load_text_mean(self, text_mean_path):
+    def _load_vision_mean(self, vision_mean_path):
         """
-        Load HOI text mean for normalization.
+        Load HOI vision mean for normalization.
+
+        Following original diffusion-bridge: uses VISION embedding mean (not text mean)
+        to center vision embeddings before diffusion refinement.
 
         Supports two formats:
-        1. Old format: Just a tensor [embed_dim]
-        2. New format: Dict with 'text_mean' key and metadata
+        1. Simple format: Just a tensor [embed_dim] or [1, embed_dim]
+        2. Dict format: Dict with 'vision_mean' key and metadata
         """
-        if not Path(text_mean_path).exists():
+        if not Path(vision_mean_path).exists():
             raise FileNotFoundError(
-                f"Text mean not found: {text_mean_path}\n"
-                f"Please run extract_adapted_text_embeddings.py first"
+                f"Vision mean not found: {vision_mean_path}\n"
+                f"Please run extract_vision_mean.py first to generate it"
             )
 
         if self.verbose:
-            print(f"\nLoading text mean from: {text_mean_path}")
+            print(f"\nLoading vision mean from: {vision_mean_path}")
 
-        with open(text_mean_path, 'rb') as f:
+        with open(vision_mean_path, 'rb') as f:
             data = pickle.load(f)
 
         # Handle both formats
         if isinstance(data, dict):
-            # New format with metadata
-            text_mean = data['text_mean']
+            # Dict format with metadata
+            vision_mean = data.get('vision_mean', data.get('image_mean', None))
+            if vision_mean is None:
+                raise ValueError(f"Dict format must contain 'vision_mean' or 'image_mean' key")
             if self.verbose:
                 print(f"  Source: {data.get('source', 'unknown')}")
-                print(f"  Num classes: {data.get('num_classes', 'unknown')}")
+                print(f"  Num images: {data.get('num_images', 'unknown')}")
                 print(f"  CLIP model: {data.get('clip_model', 'unknown')}")
         else:
-            # Old format: just tensor
-            text_mean = data
+            # Simple format: just tensor
+            vision_mean = data
             if self.verbose:
-                print(f"  Source: legacy format (raw CLIP embeddings)")
+                print(f"  Source: Computed from normalized CLIP vision embeddings")
 
         # Ensure it's a tensor
-        if not isinstance(text_mean, torch.Tensor):
-            text_mean = torch.tensor(text_mean)
+        if not isinstance(vision_mean, torch.Tensor):
+            vision_mean = torch.tensor(vision_mean)
 
-        # Ensure correct shape (should be 1D: [embed_dim])
-        if text_mean.dim() == 2 and text_mean.shape[0] == 1:
-            text_mean = text_mean.squeeze(0)
+        # Ensure correct shape (should be 1D: [embed_dim] or 2D: [1, embed_dim])
+        if vision_mean.dim() == 2 and vision_mean.shape[0] == 1:
+            vision_mean = vision_mean.squeeze(0)
 
         # Register as buffer (moves with model to GPU, but not trained)
-        self.register_buffer('_text_mean_buffer', text_mean)
+        self.register_buffer('_vision_mean_buffer', vision_mean)
 
         if self.verbose:
-            print(f"  ✓ Loaded text mean (shape: {text_mean.shape})")
-            print(f"  Text mean norm: {text_mean.norm().item():.6f}")
+            print(f"  ✓ Loaded vision mean (shape: {vision_mean.shape})")
+            print(f"  Vision mean norm: {vision_mean.norm().item():.6f}")
 
-        return text_mean
+        return vision_mean
 
     @torch.no_grad()
     def forward(self, vision_features):
         """
         Bridge vision features to text distribution using diffusion.
+
+        Following original diffusion-bridge implementation:
+        1. Normalize vision embeddings
+        2. Subtract VISION mean (centers in vision modality space)
+        3. Re-normalize (project to unit sphere)
+        4. Scale and apply diffusion refinement
+        5. Return normalized bridged embeddings
 
         Args:
             vision_features: Vision embeddings from union crops [batch, embed_dim]
@@ -259,8 +290,9 @@ class DiffusionBridgeHOI(nn.Module):
         # Step 1: First L2 normalization
         x = F.normalize(vision_features, dim=-1)
 
-        # Step 2: Subtract HOI text mean (center in modality space)
-        x = x - self._text_mean_buffer.to(x.device)
+        # Step 2: Subtract VISION mean (center in vision modality space)
+        # NOTE: Original diffusion-bridge uses VISION mean, not text mean!
+        x = x - self._vision_mean_buffer.to(x.device)
 
         # Step 3: Second L2 normalization (project to unit sphere)
         x = F.normalize(x, dim=-1)
@@ -274,6 +306,7 @@ class DiffusionBridgeHOI(nn.Module):
         # Step 6: Apply DDIM sampling (refine toward text distribution)
         # This is the key step: diffusion model learned what text embeddings look like,
         # now we use it to transform vision embeddings to be more text-like
+        # The model will perform ~5 denoising iterations (controlled by sampling_timesteps)
         x_bridged = self.diffusion.ddim_sample_with_img(x, inference_step=self.inference_steps)
 
         # Step 7: Remove channel dimension
@@ -327,7 +360,7 @@ class DiffusionBridgeHOI(nn.Module):
         """String representation for printing model"""
         return (f"inference_steps={self.inference_steps}, "
                 f"scale_factor={self.scale_factor}, "
-                f"text_mean_shape={self._text_mean_buffer.shape}")
+                f"vision_mean_shape={self._vision_mean_buffer.shape}")
 
 
 def test_diffusion_bridge():
@@ -345,15 +378,15 @@ def test_diffusion_bridge():
 
     # Test parameters
     diffusion_path = 'dummy_diffusion_files/dummy_diffusion_vitB.pt'
-    text_mean_path = 'dummy_diffusion_files/dummy_text_mean_vitB.pkl'
+    vision_mean_path = 'dummy_diffusion_files/dummy_vision_mean_vitB.pkl'
 
     # Check alternative paths
     if not Path(diffusion_path).exists():
         diffusion_path = 'hoi_diffusion_results/model-300.pt'
-        text_mean_path = 'hicodet_pkl_files/hoi_text_mean_vitB_600.pkl'
+        vision_mean_path = 'hicodet_pkl_files/hoi_vision_mean_vitB.pkl'
 
     # Check if files exist
-    has_checkpoint = Path(diffusion_path).exists() and Path(text_mean_path).exists()
+    has_checkpoint = Path(diffusion_path).exists() and Path(vision_mean_path).exists()
 
     if not has_checkpoint:
         print("⚠️  Diffusion checkpoint not found.")
@@ -364,9 +397,9 @@ def test_diffusion_bridge():
         batch_size = 4
         embed_dim = 512
 
-        # Create dummy text mean
-        text_mean = torch.randn(embed_dim)
-        text_mean = F.normalize(text_mean, dim=-1) * 0.05
+        # Create dummy vision mean
+        vision_mean = torch.randn(embed_dim)
+        vision_mean = F.normalize(vision_mean, dim=-1) * 0.05
 
         # Create features
         features = torch.randn(batch_size, embed_dim)
@@ -374,7 +407,7 @@ def test_diffusion_bridge():
 
         # Manual geometric transform (what DiffusionBridgeHOI.forward() does)
         transformed = F.normalize(features, dim=-1)
-        transformed = transformed - text_mean
+        transformed = transformed - vision_mean
         transformed = F.normalize(transformed, dim=-1)
 
         print(f"  Input shape: {features.shape}")
@@ -396,14 +429,14 @@ def test_diffusion_bridge():
     # Full test with checkpoint
     print(f"Found checkpoint files:")
     print(f"  Diffusion: {diffusion_path}")
-    print(f"  Text mean: {text_mean_path}\n")
+    print(f"  Vision mean: {vision_mean_path}\n")
 
     # Create module
     print("Test 1: Loading diffusion bridge module...")
     try:
         bridge = DiffusionBridgeHOI(
             diffusion_path=diffusion_path,
-            text_mean_path=text_mean_path,
+            vision_mean_path=vision_mean_path,
             inference_steps=100,  # Use fewer steps for testing
             verbose=True
         )
@@ -450,7 +483,7 @@ def test_diffusion_bridge():
 
     # Prepare features (already geometrically transformed)
     geo_features = F.normalize(vision_features, dim=-1)
-    geo_features = geo_features - bridge._text_mean_buffer
+    geo_features = geo_features - bridge._vision_mean_buffer
     geo_features = F.normalize(geo_features, dim=-1)
 
     print(f"  Pre-transformed features shape: {geo_features.shape}")
