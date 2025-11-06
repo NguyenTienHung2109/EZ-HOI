@@ -867,6 +867,21 @@ class UPT(nn.Module):
         if args.img_align is True:
             self.mem_adapter = Adapter(self.visual_output_dim, mem_adpt_self = True, down_size = args.emb_dim)
 
+        # Diffusion bridge for HOI ROI features
+        if args.use_diffusion_bridge:
+            from diffusion_bridge_module import DiffusionBridgeHOI
+            print(f"[INFO] Loading diffusion bridge from {args.diffusion_model_path}")
+            self.diffusion_bridge = DiffusionBridgeHOI(
+                diffusion_path=args.diffusion_model_path,
+                vision_mean_path=args.vision_mean_path,
+                inference_steps=args.inference_steps,
+                embed_dim=self.visual_output_dim
+            )
+            self.use_diffusion_bridge = True
+            print(f"[INFO] Diffusion bridge initialized with inference_steps={args.inference_steps}")
+        else:
+            self.use_diffusion_bridge = False
+
         self.select_HOI_index = kwargs['select_HOI_index']
         self.one_hots_HO, self.sample_lens_HO = self.load_cache_model(file1=file1, feature='hum_obj',num_classes=self.num_classes, num_shot=num_shot, filtered_hoi_idx = self.filtered_hoi_idx, 
                                                                                             use_multi_hot=self.use_multi_hot, label_choice=self.label_choice, num_anno=self.num_anno,
@@ -1238,10 +1253,17 @@ class UPT(nn.Module):
                 vis_feat = self.vis_fuse(torch.cat([human_features, object_features], dim=-1))
             elif self.logits_type == 'U':
                 vis_feat = union_features
+
+            # Apply vision adapter FIRST (preprocess before bridging)
             if self.img_align is True:
-                adapter_feat = (self.mem_adapter(vis_feat.unsqueeze(1))).squeeze(1)
-            else:
-                adapter_feat = vis_feat
+                vis_feat = (self.mem_adapter(vis_feat.unsqueeze(1))).squeeze(1)
+
+            # Then apply diffusion bridge to align with text distribution
+            if self.use_diffusion_bridge:
+                vis_feat = self.diffusion_bridge(vis_feat)
+                vis_feat = F.normalize(vis_feat, dim=-1)
+
+            adapter_feat = vis_feat
 
             # ========== EXTRACTION HOOK (for visualization) ========== ↓
             if hasattr(self, 'extraction_mode') and self.extraction_mode:

@@ -720,17 +720,15 @@ if __name__ == '__main__':
     parser.add_argument('--origin_ctx', default=False, action='store_true')
     parser.add_argument('--finetune_allcls_utpl', default=False, action='store_true')
 
-    # Diffusion bridge arguments (for modality alignment at inference)
+    # Diffusion bridge arguments (for HOI ROI feature alignment)
     parser.add_argument('--use_diffusion_bridge', default=False, action='store_true',
-                        help='Apply diffusion bridge at inference to reduce modality gap')
-    parser.add_argument('--diffusion_model_path', type=str, default='hoi_diffusion_results/model-300.pt',
-                        help='Path to trained diffusion model')
-    parser.add_argument('--diffusion_text_mean', type=str, default='hicodet_pkl_files/hoi_text_mean_vitB_600.pkl',
-                        help='Path to HOI text mean for normalization')
-    parser.add_argument('--diffusion_inference_steps', type=int, default=600,
-                        help='Number of DDIM sampling steps (100-1000, trade-off speed/quality)')
-    parser.add_argument('--diffusion_embed_dim', type=int, default=512,
-                        help='Embedding dimension for diffusion model (512 for ViT-B/16, 768 for ViT-L/14)')
+                        help='Apply diffusion bridge to HOI features to align with text distribution')
+    parser.add_argument('--diffusion_model_path', type=str, default='checkpoints/diffusion_bridge/model-300.pt',
+                        help='Path to trained diffusion model checkpoint')
+    parser.add_argument('--vision_mean_path', type=str, default='checkpoints/diffusion_bridge/vision_mean.pkl',
+                        help='Path to vision mean for diffusion bridge normalization')
+    parser.add_argument('--inference_steps', type=int, default=600,
+                        help='DDIM inference timestep range (600=recommended, 1000=maximum quality)')
 
 
 
