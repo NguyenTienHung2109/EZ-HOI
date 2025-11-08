@@ -1271,15 +1271,18 @@ class UPT(nn.Module):
             # ========================================================== ↑
 
             # Vision features are pre-bridged (loaded from pkl), use directly
-            # Text features remain as raw CLIP embeddings
-            adapt_hoitxt_features = hoitxt_features
-            
-            
+            # Text features: Use RAW CLIP embeddings instead of MaPLe-adapted features
+            raw_hoitxt_features = self.hoicls_txt[self.select_HOI_index].to(adapter_feat.device)
+            raw_hoitxt_features = F.normalize(raw_hoitxt_features, dim=-1)  # Ensure normalized
+
+            adapt_hoitxt_features = raw_hoitxt_features
+
+            # Optional: action descriptor still applies if --act_descriptor is used
             if len(self.act_descriptor_feat_select) == 2 and len(self.act_descriptor_feat_select[0]) > 0:
                 adapt_hoitxt_features = \
                     (self.act_descriptor_attn(adapt_hoitxt_features.unsqueeze(0),
                      (self.act_descriptor_feat_select[0][self.act_descriptor_feat_select[1]], None))).squeeze(0)
-            
+
             phi_union_HO = adapter_feat @ adapt_hoitxt_features.T
             if self.training is False and self.without_unseen_name is True:
                 logits_cache_HO = ((phi_union_HO @ self.label_HO_eval) / self.sample_lens_HO) / 2
