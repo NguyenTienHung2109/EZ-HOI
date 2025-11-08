@@ -9,6 +9,7 @@ import pdb
 
 mode_list = ['train', 'test'] 
 clip_mode_list = ['ViT-B/16' , 'ViT-L/14@336px']
+download_root = "./checkpoints/pretrained_clip"
 
 for mode in mode_list:
     for clip_mode in clip_mode_list:
@@ -19,7 +20,7 @@ for mode in mode_list:
             hico_problems = json.load(open("hicodet/test_hico.json", 'r'))
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load(clip_mode, device)
+        model, preprocess = clip.load(clip_mode, device, download_root=download_root)
         img_path = 'hicodet/hico_20160224_det/images/' + mode+"2015"   ### the dataset path
 
         file_name_clippart = 'clip336' if clip_mode == 'ViT-L/14@336px' else 'clipbase'

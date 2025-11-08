@@ -1720,7 +1720,6 @@ class UPT(nn.Module):
                                         shared_ctx = shared_ctx, compound_deeper_prompts = deep_compound_prompts_vision)
         else:
             feat_global, feat_local = self.clip_head.image_encoder(images_clip.decompose()[0], priors)
-        origin_ctx = origin_ctx[:,0,:]
 
         if torch.isnan(feat_local).any():
             print("different local", feat_local[0], feat_local[1], feat_local[2], feat_local[3])
@@ -1741,6 +1740,8 @@ class UPT(nn.Module):
             except:
                 pdb.set_trace()
             if self.origin_ctx is True:
+                origin_ctx = origin_ctx[:,0,:]
+                
                 ctx_data = torch.cat((hoitxt_features, origin_ctx), dim=0).unsqueeze(0)
                 ctx_labels = torch.tensor(list(range(len(hoitxt_features)))).unsqueeze(0).repeat(2,1).reshape (1, -1)
                 cts_loss_avg, cts_loss = self.SupCtsLoss(ctx_data, ctx_labels)

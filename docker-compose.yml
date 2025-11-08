@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  ez-hoi:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: ez-hoi-container
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./scripts:/app/scripts
+      - /mnt/sdc/duong.quang.minh/lab_data/hico_20160224_det:/app/hicodet/hico_20160224_det
+    ports:
+      - 1236:1236
+    stdin_open: true
+    tty: true
+    shm_size: 4g # Increase shared memory size if needed
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: /bin/bash

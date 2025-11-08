@@ -9,7 +9,7 @@ Usage:
         --input_dir hicodet_pkl_files/clipbase_img_hicodet_train \
         --output_dir hicodet_pkl_files/clipbase_img_hicodet_train_bridged \
         --diffusion_model hoi_diffusion_results/model-300.pt \
-        --text_mean hicodet_pkl_files/hoi_text_mean_vitB_600.pkl \
+        --vision_mean hicodet_pkl_files/hoi_vision_mean_vitB_600.pkl \
         --embed_dim 512 \
         --inference_steps 600 \
         --scale_factor 5.0
@@ -19,7 +19,7 @@ For ViT-L:
         --input_dir hicodet_pkl_files/clip336_img_hicodet_train \
         --output_dir hicodet_pkl_files/clip336_img_hicodet_train_bridged \
         --diffusion_model hoi_diffusion_results/model-vitL-300.pt \
-        --text_mean hicodet_pkl_files/hoi_text_mean_vitL_600.pkl \
+        --vision_mean hicodet_pkl_files/hoi_vision_mean_vitL_600.pkl \
         --embed_dim 768 \
         --inference_steps 600 \
         --scale_factor 5.0
@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 # Ensure local modules are imported first
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -75,15 +76,66 @@ def bridge_single_pkl(pkl_path, diffusion_bridge, device):
     return bridged_embedding
 
 
-def process_directory(input_dir, output_dir, diffusion_bridge, device):
+def process_files_on_gpu_joblib_single_model(files, output_dir, diffusion_model_path, vision_mean_path, device, embed_dim, inference_steps, scale_factor):
     """
-    Process all pkl files in input directory and save bridged versions to output directory.
+    Process a list of files on a specific GPU using a single model instance.
+
+    Args:
+        files: List of pkl files to process
+        output_dir: Directory to save the bridged embeddings
+        diffusion_model_path: Path to the diffusion model checkpoint
+        vision_mean_path: Path to the vision mean file
+        device: torch.device
+        embed_dim: Embedding dimension
+        inference_steps: Number of inference steps
+        scale_factor: Scale factor for normalization
+    """
+    # Initialize a single model for this GPU
+    diffusion_bridge = DiffusionBridgeHOI(
+        diffusion_path=diffusion_model_path,
+        vision_mean_path=vision_mean_path,
+        inference_steps=inference_steps,
+        scale_factor=scale_factor,
+        embed_dim=embed_dim,
+        verbose=False
+    ).to(device)  # Ensure model is moved to the correct device
+    diffusion_bridge.eval()
+
+    success_count = 0
+    error_count = 0
+    
+    for pkl_path in tqdm(files, desc=f"Bridging embeddings on {device}", dynamic_ncols=True):
+        try:
+            # Bridge the embedding
+            bridged_embedding = bridge_single_pkl(pkl_path, diffusion_bridge, device)
+
+            # Save to output directory with same filename
+            output_path = os.path.join(output_dir, pkl_path.name)
+            with open(output_path, 'wb') as f:
+                pickle.dump(bridged_embedding, f)
+            success_count += 1
+
+        except Exception as e:
+            print(f"\nError processing {pkl_path.name} on {device}: {e}")
+            error_count += 1
+    
+    print(f"\nFinished processing on {device}: {success_count} succeeded, {error_count} failed.")
+
+
+def process_directory_joblib_single_model(input_dir, output_dir, diffusion_model_path, vision_mean_path, num_gpus, embed_dim, inference_steps, scale_factor):
+    """
+    Process all pkl files in input directory in parallel across multiple GPUs using joblib.
+    Each GPU creates a single model instance to process its assigned files.
 
     Args:
         input_dir: Source directory containing original pkl files
         output_dir: Target directory for bridged pkl files
-        diffusion_bridge: DiffusionBridgeHOI module
-        device: torch.device
+        diffusion_model_path: Path to the diffusion model checkpoint
+        vision_mean_path: Path to the vision mean file
+        num_gpus: Number of GPUs to use
+        embed_dim: Embedding dimension
+        inference_steps: Number of inference steps
+        scale_factor: Scale factor for normalization
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -100,34 +152,26 @@ def process_directory(input_dir, output_dir, diffusion_bridge, device):
     print(f"Output directory: {output_dir}")
     print()
 
-    # Process each file
-    success_count = 0
-    error_count = 0
+    # Divide files among GPUs
+    files_per_gpu = len(pkl_files) // num_gpus
+    file_splits = [pkl_files[i * files_per_gpu: (i + 1) * files_per_gpu] for i in range(num_gpus)]
 
-    for pkl_path in tqdm(pkl_files, desc="Bridging embeddings", dynamic_ncols=True):
-        try:
-            # Bridge the embedding
-            bridged_embedding = bridge_single_pkl(pkl_path, diffusion_bridge, device)
 
-            # Save to output directory with same filename
-            output_path = os.path.join(output_dir, pkl_path.name)
-            with open(output_path, 'wb') as f:
-                pickle.dump(bridged_embedding, f)
+    # Assign remaining files to the last GPU
+    if len(pkl_files) % num_gpus != 0:
+        file_splits[-1].extend(pkl_files[num_gpus * files_per_gpu:])    
 
-            success_count += 1
+    print(f"Using {num_gpus} GPUs for processing")
+    print("File distribution among GPUs:")
+    for gpu_id, files in enumerate(file_splits):
+        print(f"  GPU {gpu_id}: {len(files)} files")
 
-        except Exception as e:
-            print(f"\nError processing {pkl_path.name}: {e}")
-            error_count += 1
-            continue
-
-    print()
-    print("="*60)
-    print(f"Processing complete!")
-    print(f"  Successfully bridged: {success_count} files")
-    if error_count > 0:
-        print(f"  Errors: {error_count} files")
-    print("="*60)
+    # Process files in parallel using joblib
+    Parallel(n_jobs=num_gpus)(
+        delayed(process_files_on_gpu_joblib_single_model)(
+            files, output_dir, diffusion_model_path, vision_mean_path, f"cuda:{gpu_id}", embed_dim, inference_steps, scale_factor
+        ) for gpu_id, files in enumerate(file_splits)
+    )
 
 
 def main():
@@ -142,8 +186,8 @@ def main():
     # Diffusion bridge configuration
     parser.add_argument('--diffusion_model', type=str, required=True,
                         help='Path to trained diffusion model checkpoint (.pt)')
-    parser.add_argument('--text_mean', type=str, required=True,
-                        help='Path to HOI text mean file (.pkl)')
+    parser.add_argument('--vision_mean', type=str, required=True,
+                        help='Path to HOI vision mean file (.pkl)')
     parser.add_argument('--embed_dim', type=int, default=512,
                         help='Embedding dimension (512 for ViT-B, 768 for ViT-L)')
     parser.add_argument('--inference_steps', type=int, default=600,
@@ -152,43 +196,26 @@ def main():
                         help='Normalization scale factor (default: 5.0)')
 
     # Device configuration
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--num_gpus', type=int, default=torch.cuda.device_count(),
+                        help='Number of GPUs to use (default: all available)')
 
     args = parser.parse_args()
-
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    print()
 
     # Check if input directory exists
     if not os.path.exists(args.input_dir):
         raise FileNotFoundError(f"Input directory not found: {args.input_dir}")
 
-    # Check if diffusion model and text mean exist
+    # Check if diffusion model and vision mean exist
     if not os.path.exists(args.diffusion_model):
         raise FileNotFoundError(f"Diffusion model not found: {args.diffusion_model}")
-    if not os.path.exists(args.text_mean):
-        raise FileNotFoundError(f"Text mean file not found: {args.text_mean}")
+    if not os.path.exists(args.vision_mean):
+        raise FileNotFoundError(f"Vision mean file not found: {args.vision_mean}")
 
-    # Initialize diffusion bridge
-    print("Initializing Diffusion Bridge...")
-    print("="*60)
-    diffusion_bridge = DiffusionBridgeHOI(
-        diffusion_path=args.diffusion_model,
-        text_mean_path=args.text_mean,
-        inference_steps=args.inference_steps,
-        scale_factor=args.scale_factor,
-        embed_dim=args.embed_dim,
-        verbose=True
+    # Process directory in parallel across GPUs using joblib
+    process_directory_joblib_single_model(
+        args.input_dir, args.output_dir, args.diffusion_model, args.vision_mean,
+        args.num_gpus, args.embed_dim, args.inference_steps, args.scale_factor
     )
-    diffusion_bridge = diffusion_bridge.to(device)
-    diffusion_bridge.eval()
-    print()
-
-    # Process directory
-    process_directory(args.input_dir, args.output_dir, diffusion_bridge, device)
 
     print()
     print("All done! You can now use the bridged embeddings for training.")

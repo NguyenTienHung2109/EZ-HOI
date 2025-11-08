@@ -67,8 +67,8 @@ def relocate_to_cuda(
         for key in x:
             x[key] = relocate_to_cuda(x[key], ignore, device, **kwargs)
         return x
-    elif isinstance(x, str):
-        return x
+    # elif isinstance(x, str):
+    #     return x
     elif not ignore:
         raise TypeError('Unsupported type of data {}'.format(type(x)))
 

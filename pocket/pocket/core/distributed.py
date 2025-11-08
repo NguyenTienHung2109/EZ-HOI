@@ -165,12 +165,30 @@ class DistributedLearningEngine(State):
         if self._state.lr_scheduler is not None:
             self._state.lr_scheduler.step()
 
+    # def _on_start_iteration(self):        
+    #     self._state.iteration += 1
+    #     self._state.inputs = relocate_to_cuda(self._state.inputs, non_blocking=True)
+    #     self._state.targets.pop("filename", None)  
+    #     self._state.targets = relocate_to_cuda(self._state.targets, non_blocking=True)
+
     def _on_start_iteration(self):
+        # Increment the iteration count
         self._state.iteration += 1
+        # Move input data to the CUDA device in non-blocking mode
         self._state.inputs = relocate_to_cuda(self._state.inputs, non_blocking=True)
-        if isinstance(self._state.targets, dict):
-            self._state.targets.pop("filename", None)
-        self._state.targets = relocate_to_cuda(self._state.targets, non_blocking=True)
+        
+        # Extract the 'filename' field and save it
+        file = [tgt.pop('filename', None) for tgt in self._state.targets]
+        
+        # Move targets to CUDA, ignoring non-Tensor types of data
+        self._state.targets = relocate_to_cuda(self._state.targets, non_blocking=True, ignore=True)
+        
+        # Re-assign the 'filename' field
+        for idx, tgti in enumerate(self._state.targets):
+            # Ensure 'filename' exists
+            if file[idx] is not None:
+                self._state.targets[idx]['filename'] = file[idx]
+
 
     def _on_end_iteration(self):
         # Print stats in the master process
